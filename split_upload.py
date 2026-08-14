@@ -9,61 +9,78 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TEMP_DIR = "gofile_parts"
 LINKS_FILE = "gofile_links.txt"
 
-# استخدام Session لإعادة استخدام اتصالات الشبكة والسرعة القصوى
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 })
 
+cached_token = None
 cached_server = None
 
-def get_best_gofile_server():
-    global cached_server
-    if cached_server:
-        return cached_server
-    
+def init_gofile_session():
+    """تهيئة الجلسة وجلب Token وسيرفر الرفع"""
+    global cached_token, cached_server
     try:
-        res = session.get("https://api.gofile.io/servers", timeout=15)
-        if res.status_code == 200 and res.json().get("status") == "ok":
-            servers = res.json()["data"].get("servers", [])
+        acc_res = session.post("https://api.gofile.io/accounts", timeout=15)
+        if acc_res.status_code == 200 and acc_res.json().get("status") == "ok":
+            cached_token = acc_res.json()["data"]["token"]
+            session.cookies.set("accountToken", cached_token)
+
+        srv_res = session.get("https://api.gofile.io/servers", timeout=15)
+        if srv_res.status_code == 200 and srv_res.json().get("status") == "ok":
+            servers = srv_res.json()["data"].get("servers", [])
             if servers:
                 cached_server = servers[0]["name"]
-                return cached_server
     except Exception as e:
-        print(f"⚠️ فشل جلب خادم Gofile: {e}", flush=True)
+        print(f"⚠️ تنبيه أثناء التهيئة: {e}", flush=True)
+
+def fetch_direct_link(folder_code, filename):
+    """جلب الرابط المباشر الصريح فقط"""
+    if not cached_token or not folder_code:
+        return None
+    try:
+        url = f"https://api.gofile.io/contents/{folder_code}?token={cached_token}"
+        res = session.get(url, timeout=15)
+        if res.status_code == 200 and res.json().get("status") == "ok":
+            children = res.json()["data"].get("children", {})
+            for item_id, item in children.items():
+                if item.get("name") == filename or item.get("type") == "file":
+                    return item.get("link")
+    except Exception:
+        pass
     return None
 
-def upload_worker(part_num, filepath, max_retries=3):
-    """دالة رفع تعمل في الخلفية بشكل منفصل"""
-    server_name = get_best_gofile_server()
-    if not server_name:
-        server_name = "store1" # خادم افتراضي في حال الفشل
-
+def upload_worker(part_num, filepath, filename, max_retries=3):
+    """رفع الجزء وجلب رابط التنزيل المباشر"""
+    server_name = cached_server or "store1"
     upload_url = f"https://{server_name}.gofile.io/contents/uploadfile"
     
-    print(f"🚀 [خلفية] بدء رفع الجزء {part_num} على {server_name}...", flush=True)
+    payload = {}
+    if cached_token:
+        payload["token"] = cached_token
+
+    print(f"🚀 رفع الجزء {part_num}...", flush=True)
     
     for attempt in range(1, max_retries + 1):
         try:
             with open(filepath, "rb") as f:
                 files = {"file": f}
-                u_res = session.post(upload_url, files=files, timeout=900)
+                u_res = session.post(upload_url, data=payload, files=files, timeout=900)
             
             if u_res.status_code == 200:
                 data = u_res.json()
                 if data.get("status") == "ok":
                     fdata = data.get("data", {})
-                    link = fdata.get("downloadPage") or (f"https://gofile.io/d/{fdata.get('code')}" if fdata.get('code') else None)
-                    if link:
-                        print(f"✅ [اكتمل] الجزء {part_num}: {link}", flush=True)
-                        # حذف الملف المؤقت فور انتهاء الرفع لتوفير المساحة
-                        if os.path.exists(filepath):
-                            os.remove(filepath)
-                        return part_num, link
-            
-            print(f"⚠️ محاولة {attempt} للجزء {part_num} لم تكتمل، إعادة المحاولة...", flush=True)
-        except Exception as e:
-            print(f"⚠️ خطأ أثناء رفع الجزء {part_num} (محاولة {attempt}): {e}", flush=True)
+                    folder_code = fdata.get("code")
+
+                    direct_link = fetch_direct_link(folder_code, filename)
+
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                    
+                    return part_num, direct_link
+        except Exception:
+            pass
         
         time.sleep(2)
 
@@ -81,10 +98,11 @@ def main():
     CHUNK_SIZE = chunk_size_mb * 1024 * 1024
     os.makedirs(TEMP_DIR, exist_ok=True)
 
-    print(f"⚡ بدء العملية بالسرعة القصوى (تنزيل ورفع بالتوازي) - بحجم {chunk_size_mb}MB...", flush=True)
+    init_gofile_session()
+
+    print(f"⚡ بدء التقسيم والرفع (حجم الجزء: {chunk_size_mb}MB)...", flush=True)
 
     futures = []
-    # السماح برفع جُزأين في الخلفية في نفس الوقت لزيادة تدفق البيانات
     executor = ThreadPoolExecutor(max_workers=3)
 
     part_num = 1
@@ -98,7 +116,7 @@ def main():
             part_file = open(part_path, "wb")
 
             try:
-                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024): # زيادة حجم البافر لـ 4MB لسرعة أكبر
+                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
                     if not chunk:
                         continue
                     part_file.write(chunk)
@@ -106,9 +124,7 @@ def main():
 
                     if current_size >= CHUNK_SIZE:
                         part_file.close()
-                        
-                        # إرسال عملية الرفع إلى الخلفية والاستمرار فوراً في تنزيل الجزء التالي!
-                        future = executor.submit(upload_worker, part_num, part_path)
+                        future = executor.submit(upload_worker, part_num, part_path, part_filename)
                         futures.append(future)
 
                         part_num += 1
@@ -120,7 +136,7 @@ def main():
                 part_file.close()
 
                 if current_size > 0:
-                    future = executor.submit(upload_worker, part_num, part_path)
+                    future = executor.submit(upload_worker, part_num, part_path, part_filename)
                     futures.append(future)
                 else:
                     if os.path.exists(part_path):
@@ -131,32 +147,31 @@ def main():
                     part_file.close()
 
     except Exception as e:
-        print(f"❌ خطأ أثناء تنزيل الملف الأصلي: {e}", flush=True)
+        print(f"❌ خطأ أثناء العملية: {e}", flush=True)
         executor.shutdown(wait=False)
         sys.exit(1)
 
-    # انتظار انتهاء جميع المهام في الخلفية وتجميع الروابط
     results = []
     for future in as_completed(futures):
         res = future.result()
         if res and res[1]:
             results.append(res)
-        else:
-            print("❌ فشلت إحدى عمليات الرفع في الخلفية!", flush=True)
 
     executor.shutdown(wait=True)
-
-    # ترتيب الروابط حسب رقم الجزء
+    
+    # فرز النتيجة حسب رقم الجزء لضمان الترتيب
     results.sort(key=lambda x: x[0])
 
+    print("\n🔗 --- الروابط المباشرة المرتبة ---", flush=True)
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
         for num, link in results:
+            print(f"الجزء {num}: {link}", flush=True)
             f.write(f"الجزء {num}: {link}\n")
 
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
-    print("🏁 انتهت جميع العمليات بنجاح وبأقصى سرعة!", flush=True)
+    print("\n✅ اكتملت العملية وتم حفظ الروابط المباشرة المرتبة بنجاح!", flush=True)
 
 if __name__ == "__main__":
     main()
