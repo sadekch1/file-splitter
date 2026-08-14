@@ -13,38 +13,74 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-def upload_with_curl(filepath, filename, retries=3):
-    """استخدام curl المستقر لتفادي انقطاع اتصال SSL مع الملفات الضخمة"""
-    url = f"https://pixeldrain.com/api/file/{filename}"
+def upload_litterbox(filepath, filename):
+    """رفع إلى Litterbox (يدعم حتى 1GB للملف وتدوم الروابط 24 ساعة)"""
+    try:
+        cmd = [
+            "curl", "-s",
+            "-F", "reqtype=fileupload",
+            "-F", "time=24h",
+            "-F", f"fileToUpload=@{filepath}",
+            "https://litterbox.catbox.moe/resources/internals/api.php"
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        url = res.stdout.strip()
+        if url.startswith("http"):
+            return url
+    except Exception as e:
+        print(f"Litterbox log: {e}", flush=True)
+    return None
+
+def upload_transfersh(filepath, filename):
+    """رفع إلى Transfer.sh (سريع جداً ومستقر)"""
+    try:
+        cmd = [
+            "curl", "-s",
+            "--upload-file", filepath,
+            f"https://transfer.sh/{filename}"
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        url = res.stdout.strip()
+        if url.startswith("http"):
+            return url
+    except Exception as e:
+        print(f"Transfer.sh log: {e}", flush=True)
+    return None
+
+def upload_pixeldrain(filepath, filename):
+    """رفع إلى Pixeldrain عبر POST multipart"""
+    try:
+        cmd = [
+            "curl", "-s",
+            "-F", f"file=@{filepath};filename={filename}",
+            "https://pixeldrain.com/api/file"
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if res.stdout:
+            data = json.loads(res.stdout)
+            if data.get("success"):
+                return f"https://pixeldrain.com/u/{data.get('id')}"
+    except Exception as e:
+        print(f"Pixeldrain log: {e}", flush=True)
+    return None
+
+def upload_part_with_fallback(filepath, filename):
+    """تجربة السيرفرات بالترتيب لضمان نجاح الرفع دائماً"""
+    providers = [
+        ("Litterbox", upload_litterbox),
+        ("Transfer.sh", upload_transfersh),
+        ("Pixeldrain", upload_pixeldrain),
+    ]
     
-    for attempt in range(1, retries + 1):
-        try:
-            cmd = [
-                "curl", "-s",
-                "-X", "PUT",
-                "-T", filepath,
-                "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                url
-            ]
-            
-            # تنفيذ أمر curl مباشرة من نظام التشغيل
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            
-            if result.returncode == 0 and result.stdout:
-                try:
-                    data = json.loads(result.stdout)
-                    if data.get("success"):
-                        file_id = data.get("id")
-                        return f"https://pixeldrain.com/u/{file_id}"
-                except json.JSONDecodeError:
-                    pass
-            
-            print(f"⚠️ محاولة رفع {attempt}/{retries} فشلت، جاري الإعادة...", flush=True)
-            
-        except Exception as e:
-            print(f"⚠️ خطأ أثناء تنفيذ محاولة {attempt}: {e}", flush=True)
-            
-    raise RuntimeError(f"فشل الرفع بعد {retries} محاولات")
+    for name, provider in providers:
+        print(f"🔄 جاري التجربة على {name}...", flush=True)
+        url = provider(filepath, filename)
+        if url:
+            print(f"✅ تم الرفع بنجاح على {name}!", flush=True)
+            return url
+        print(f"⚠️ متعذر على {name}، الانتقال للبديل...", flush=True)
+        
+    raise RuntimeError("فشلت جميع سيرفرات الرفع المتاحة")
 
 def main():
     if len(sys.argv) < 2:
@@ -60,7 +96,7 @@ def main():
     part_num = 1
     current_size = 0
 
-    print(f"⬇️ جاري بدء تحميل الملف وتجزئته بحجم {chunk_size_mb} ميجابايت...", flush=True)
+    print(f"⬇️ جاري تحميل وتجزئة الملف بحجم {chunk_size_mb}MB...", flush=True)
 
     try:
         with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
@@ -78,10 +114,10 @@ def main():
 
                     if current_size >= CHUNK_SIZE:
                         part_file.close()
-                        print(f"📤 جاري رفع الجزء {part_num} عبر curl...", flush=True)
-                        link = upload_with_curl(part_path, part_filename)
+                        print(f"📤 رفع الجزء {part_num}...", flush=True)
+                        link = upload_part_with_fallback(part_path, part_filename)
                         
-                        # الرمز ✅ ضروري ليتعرف عليه سكربت Termux
+                        # الرمز ✅ ليتعرف عليه سكربت Termux
                         print(f"✅ الجزء {part_num}: {link}", flush=True)
                         links.append((part_num, link))
                         os.remove(part_path)
@@ -95,8 +131,8 @@ def main():
                 part_file.close()
 
                 if current_size > 0:
-                    print(f"📤 جاري رفع الجزء {part_num} عبر curl...", flush=True)
-                    link = upload_with_curl(part_path, part_filename)
+                    print(f"📤 رفع الجزء {part_num}...", flush=True)
+                    link = upload_part_with_fallback(part_path, part_filename)
                     print(f"✅ الجزء {part_num}: {link}", flush=True)
                     links.append((part_num, link))
                     os.remove(part_path)
