@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import sys
 import os
+import json
 import shutil
+import subprocess
 import requests
 
 TEMP_DIR = "gofile_parts"
@@ -11,35 +13,38 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-def upload_to_pixeldrain(filepath, filename, retries=3):
-    """رفع الملف إلى Pixeldrain الذي يتميز بالسرعة وعدم حظر سيرفرات GitHub"""
+def upload_with_curl(filepath, filename, retries=3):
+    """استخدام curl المستقر لتفادي انقطاع اتصال SSL مع الملفات الضخمة"""
     url = f"https://pixeldrain.com/api/file/{filename}"
-    last_err = None
     
     for attempt in range(1, retries + 1):
         try:
-            with open(filepath, "rb") as f:
-                # استخدام PUT لرفع مباشر ومستقر للملفات الكبيرة
-                resp = requests.put(
-                    url,
-                    data=f,
-                    headers=HEADERS,
-                    timeout=600  # مهلة 10 دقائق
-                )
-            resp.raise_for_status()
-            data = resp.json()
+            cmd = [
+                "curl", "-s",
+                "-X", "PUT",
+                "-T", filepath,
+                "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                url
+            ]
             
-            if data.get("success"):
-                file_id = data.get("id")
-                return f"https://pixeldrain.com/u/{file_id}"
-            else:
-                raise RuntimeError(f"استجابة غير متوقعة: {data}")
-                
+            # تنفيذ أمر curl مباشرة من نظام التشغيل
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            
+            if result.returncode == 0 and result.stdout:
+                try:
+                    data = json.loads(result.stdout)
+                    if data.get("success"):
+                        file_id = data.get("id")
+                        return f"https://pixeldrain.com/u/{file_id}"
+                except json.JSONDecodeError:
+                    pass
+            
+            print(f"⚠️ محاولة رفع {attempt}/{retries} فشلت، جاري الإعادة...", flush=True)
+            
         except Exception as e:
-            last_err = e
-            print(f"⚠️ محاولة رفع {attempt}/{retries} فشلت: {e}", flush=True)
+            print(f"⚠️ خطأ أثناء تنفيذ محاولة {attempt}: {e}", flush=True)
             
-    raise RuntimeError(f"فشل الرفع بعد {retries} محاولات: {last_err}")
+    raise RuntimeError(f"فشل الرفع بعد {retries} محاولات")
 
 def main():
     if len(sys.argv) < 2:
@@ -73,10 +78,10 @@ def main():
 
                     if current_size >= CHUNK_SIZE:
                         part_file.close()
-                        print(f"📤 جاري رفع الجزء {part_num} إلى Pixeldrain...", flush=True)
-                        link = upload_to_pixeldrain(part_path, part_filename)
+                        print(f"📤 جاري رفع الجزء {part_num} عبر curl...", flush=True)
+                        link = upload_with_curl(part_path, part_filename)
                         
-                        # الرمز ✅ ضروري ليتعرف عليه سكربت Termux لقراءة التقدم
+                        # الرمز ✅ ضروري ليتعرف عليه سكربت Termux
                         print(f"✅ الجزء {part_num}: {link}", flush=True)
                         links.append((part_num, link))
                         os.remove(part_path)
@@ -90,8 +95,8 @@ def main():
                 part_file.close()
 
                 if current_size > 0:
-                    print(f"📤 جاري رفع الجزء {part_num} إلى Pixeldrain...", flush=True)
-                    link = upload_to_pixeldrain(part_path, part_filename)
+                    print(f"📤 جاري رفع الجزء {part_num} عبر curl...", flush=True)
+                    link = upload_with_curl(part_path, part_filename)
                     print(f"✅ الجزء {part_num}: {link}", flush=True)
                     links.append((part_num, link))
                     os.remove(part_path)
@@ -107,7 +112,7 @@ def main():
         print(f"❌ خطأ أثناء العملية: {e}", flush=True)
         sys.exit(1)
 
-    # حفظ الروابط في الملف النهائي
+    # حفظ الروابط
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
         for num, link in links:
             f.write(f"الجزء {num}: {link}\n")
