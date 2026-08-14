@@ -1,60 +1,63 @@
 #!/usr/bin/env python3
 import sys
 import os
-import time
 import shutil
-import subprocess
 import requests
 
 TEMP_DIR = "gofile_parts"
 LINKS_FILE = "gofile_links.txt"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 
-def upload_0x0(filepath):
-    """رفع خفيف وسريع على 0x0.st (يدعم حتى 512MB ويرجع رابطاً نصياً مباشرة)"""
-    cmd = [
-        "curl", "-s", "-F", f"file=@{filepath}", "https://0x0.st"
-    ]
+def upload_pixeldrain(filepath):
+    """الرفع إلى Pixeldrain (يدعم حزم كبيرة ومستقر جداً مع GitHub Actions)"""
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        url = res.stdout.strip()
-        if url.startswith("http://") or url.startswith("https://"):
-            return url
+        url = "https://pixeldrain.com/api/file"
+        with open(filepath, "rb") as f:
+            res = requests.post(url, files={"file": f}, timeout=600)
+            
+        if res.status_code == 200 or res.status_code == 201:
+            data = res.json()
+            if data.get("success"):
+                file_id = data.get("id")
+                return f"https://pixeldrain.com/u/{file_id}"
+        print(f"⚠️ Pixeldrain response ({res.status_code}): {res.text[:100]}", flush=True)
     except Exception as e:
-        print(f"⚠️ خطأ في 0x0.st: {e}", flush=True)
+        print(f"⚠️ استثناء Pixeldrain: {e}", flush=True)
     return None
 
-def upload_transfersh(filepath, filename):
-    """بديل خفيف ثانٍ: transfer.sh"""
-    cmd = [
-        "curl", "-s", "--upload-file", filepath, f"https://transfer.sh/{filename}"
-    ]
+def upload_tmpfiles(filepath):
+    """بديل احتياطي: Tmpfiles.org"""
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        url = res.stdout.strip()
-        if url.startswith("http://") or url.startswith("https://"):
-            return url
+        url = "https://tmpfiles.org/api/v1/upload"
+        with open(filepath, "rb") as f:
+            res = requests.post(url, files={"file": f}, timeout=600)
+            
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("status") == "success":
+                raw_url = data["data"]["url"]
+                # تحويل الرابط إلى رابط تنزيل مباشر
+                direct_url = raw_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+                return direct_url
+        print(f"⚠️ Tmpfiles response ({res.status_code}): {res.text[:100]}", flush=True)
     except Exception as e:
-        print(f"⚠️ خطأ في transfer.sh: {e}", flush=True)
+        print(f"⚠️ استثناء Tmpfiles: {e}", flush=True)
     return None
 
-def upload_part_fast(filepath, filename):
-    # المحاولة الأولى على 0x0.st
-    url = upload_0x0(filepath)
-    if url:
-        print("✅ تم الرفع عبر 0x0.st", flush=True)
-        return url
-    
-    # المحاولة الثانية على transfer.sh
-    print("⚠️ تجربة السيرفر الخفيف الثاني (transfer.sh)...", flush=True)
-    url = upload_transfersh(filepath, filename)
-    if url:
-        print("✅ تم الرفع عبر transfer.sh", flush=True)
-        return url
+def upload_part(filepath, filename):
+    print("🔄 جاري الرفع على Pixeldrain...", flush=True)
+    link = upload_pixeldrain(filepath)
+    if link:
+        return link
         
+    print("⚠️ تجربة السيرفر الاحتياطي (Tmpfiles)...", flush=True)
+    link = upload_tmpfiles(filepath)
+    if link:
+        return link
+
     return None
 
 def main():
@@ -71,7 +74,7 @@ def main():
     part_num = 1
     current_size = 0
 
-    print(f"⬇️ جاري المعالجة بحجم {chunk_size_mb}MB عبر سيرفر خفيف وسريع...", flush=True)
+    print(f"⬇️ جاري معالجة الملف وتقسيمه إلى أجزاء بحجم {chunk_size_mb}MB...", flush=True)
 
     try:
         with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
@@ -90,7 +93,7 @@ def main():
                     if current_size >= CHUNK_SIZE:
                         part_file.close()
                         print(f"📤 رفع الجزء {part_num}...", flush=True)
-                        link = upload_part_fast(part_path, part_filename)
+                        link = upload_part(part_path, part_filename)
                         if not link:
                             raise RuntimeError(f"فشل رفع الجزء {part_num}")
                         
@@ -108,7 +111,7 @@ def main():
 
                 if current_size > 0:
                     print(f"📤 رفع الجزء {part_num}...", flush=True)
-                    link = upload_part_fast(part_path, part_filename)
+                    link = upload_part(part_path, part_filename)
                     if not link:
                         raise RuntimeError(f"فشل رفع الجزء {part_num}")
                     print(f"✅ الجزء {part_num}: {link}", flush=True)
