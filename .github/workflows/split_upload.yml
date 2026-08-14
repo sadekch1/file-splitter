@@ -1,0 +1,40 @@
+name: Split and Upload to GoFile
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'رابط التحميل المباشر'
+        required: true
+        type: string
+      chunk_size_mb:
+        description: 'حجم الجزء بالميغابايت'
+        required: false
+        default: '200'
+        type: string
+
+jobs:
+  split-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run split & upload script
+        run: python split_upload.py "${{ github.event.inputs.url }}" "${{ github.event.inputs.chunk_size_mb }}"
+
+      - name: Upload links file as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gofile-links
+          path: gofile_links.txt
