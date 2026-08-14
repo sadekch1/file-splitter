@@ -10,11 +10,11 @@ TEMP_DIR = "gofile_parts"
 LINKS_FILE = "gofile_links.txt"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 }
 
-def upload_litterbox_safe(filepath, filename, max_retries=5):
-    """رفع الملف إلى Litterbox مع معالجة ذكية لحظر Cloudflare"""
+def upload_litterbox_strict(filepath, filename, max_retries=10):
+    """رفع الملف إلى Litterbox حصراً مع تجاوز حظر Cloudflare"""
     cmd = [
         "curl", "-s", "-L",
         "-A", HEADERS["User-Agent"],
@@ -30,22 +30,23 @@ def upload_litterbox_safe(filepath, filename, max_retries=5):
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
             url = res.stdout.strip()
             
-            # التأكد من الحصول على رابط مباشر وليس صفحة خطأ HTML
-            if url.startswith("http"):
-                print("✅ تم الرفع بنجاح دون حظر!", flush=True)
+            # التأكد من استلام رابط مباشر وليس صفحة خطأ Cloudflare
+            if url.startswith("http://") or url.startswith("https://"):
+                print("✅ تم الرفع بنجاح على Litterbox!", flush=True)
                 return url
             else:
-                print(f"⚠️ استجابة غير معتادة (حظر مؤقت من السيرفر).", flush=True)
+                print(f"⚠️ استجابة Cloudflare/Litterbox ليست رابطاً (حظر مؤقت للـ IP).", flush=True)
 
         except Exception as e:
-            print(f"⚠️ خطأ في الاتصال: {e}", flush=True)
+            print(f"⚠️ خطأ أثناء الاتصال: {e}", flush=True)
 
         if attempt < max_retries:
-            wait_time = 45  # انتظار 45 ثانية لتصفير عداد الحظر
-            print(f"⏳ جاري الانتظار {wait_time} ثانية لتصفير عداد الحظر لدى السيرفر...", flush=True)
+            # انتظار 60 ثانية لتسديد عداد Cloudflare
+            wait_time = 60
+            print(f"⏳ [تجاوز الحظر] انتظار {wait_time} ثانية لتصفير عداد طلبات Cloudflare...", flush=True)
             time.sleep(wait_time)
 
-    raise RuntimeError("فشل الرفع على Litterbox بعد عدة محاولات")
+    raise RuntimeError("فشل الرفع على Litterbox بعد استنفاد كل المحاولات")
 
 def main():
     if len(sys.argv) < 2:
@@ -53,7 +54,7 @@ def main():
         sys.exit(1)
 
     url = sys.argv[1]
-    # تثبيت الحجم الإفتراضي على 200MB بناءً على طلبك
+    # حجم ثابت 200MB
     chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 200
     CHUNK_SIZE = chunk_size_mb * 1024 * 1024
     os.makedirs(TEMP_DIR, exist_ok=True)
@@ -62,7 +63,7 @@ def main():
     part_num = 1
     current_size = 0
 
-    print(f"⬇️ جاري المعالجة بحجم جزء {chunk_size_mb}MB (Litterbox حصراً مع نظام التبريد)...", flush=True)
+    print(f"⬇️ جاري المعالجة بحجم {chunk_size_mb}MB (Litterbox حصراً مع حماية متقدمة)...", flush=True)
 
     try:
         with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
@@ -81,18 +82,18 @@ def main():
                     if current_size >= CHUNK_SIZE:
                         part_file.close()
                         print(f"📤 رفع الجزء {part_num}...", flush=True)
-                        link = upload_litterbox_safe(part_path, part_filename)
+                        link = upload_litterbox_strict(part_path, part_filename)
                         
                         print(f"✅ الجزء {part_num}: {link}", flush=True)
                         links.append((part_num, link))
                         os.remove(part_path)
 
-                        # نظام التبريد الدوري: راحة 45 ثانية بعد كل 3 أجزاء، و 10 ثوانٍ بين الأجزاء العادية
+                        # بعد كل 3 أجزاء، انتظار 90 ثانية لتصفير الحظر تماماً
                         if part_num % 3 == 0:
-                            print("💤 [استراحة تبريد الـ IP] انتظار 45 ثانية لتفادي الحظر نهائياً...", flush=True)
-                            time.sleep(45)
+                            print("💤 [راحة دورية] انتظار 90 ثانية لضمان عدم الحظر من Cloudflare...", flush=True)
+                            time.sleep(90)
                         else:
-                            time.sleep(10)
+                            time.sleep(15)
 
                         part_num += 1
                         current_size = 0
@@ -104,7 +105,7 @@ def main():
 
                 if current_size > 0:
                     print(f"📤 رفع الجزء {part_num}...", flush=True)
-                    link = upload_litterbox_safe(part_path, part_filename)
+                    link = upload_litterbox_strict(part_path, part_filename)
                     print(f"✅ الجزء {part_num}: {link}", flush=True)
                     links.append((part_num, link))
                     os.remove(part_path)
@@ -120,7 +121,6 @@ def main():
         print(f"❌ خطأ أثناء العملية: {e}", flush=True)
         sys.exit(1)
 
-    # حفظ الروابط
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
         for num, link in links:
             f.write(f"الجزء {num}: {link}\n")
