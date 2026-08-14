@@ -44,7 +44,7 @@ def fetch_direct_link(folder_code, filename):
         if res.status_code == 200 and res.json().get("status") == "ok":
             children = res.json()["data"].get("children", {})
             for item_id, item in children.items():
-                if item.get("name") == filename or item.get("type") == "file":
+                if item.get("link"):
                     return item.get("link")
     except Exception:
         pass
@@ -72,13 +72,16 @@ def upload_worker(part_num, filepath, filename, max_retries=3):
                 if data.get("status") == "ok":
                     fdata = data.get("data", {})
                     folder_code = fdata.get("code")
+                    download_page = fdata.get("downloadPage")
 
                     direct_link = fetch_direct_link(folder_code, filename)
+                    # إذا تعذر استخراج الرابط المباشر يتم إرجاع رابط التنزيل الأساسي لضمان عدم القفز عن الجزء
+                    final_link = direct_link if direct_link else download_page
 
                     if os.path.exists(filepath):
                         os.remove(filepath)
                     
-                    return part_num, direct_link
+                    return part_num, final_link
         except Exception:
             pass
         
@@ -165,8 +168,9 @@ def main():
     print("\n🔗 --- الروابط المباشرة المرتبة ---", flush=True)
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
         for num, link in results:
-            print(f"الجزء {num}: {link}", flush=True)
-            f.write(f"الجزء {num}: {link}\n")
+            out_str = f"الجزء {num}: {link}"
+            print(out_str, flush=True)
+            f.write(out_str + "\n")
 
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
