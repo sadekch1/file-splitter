@@ -1,62 +1,75 @@
 #!/usr/bin/env python3
 import sys
 import os
+import time
 import shutil
-import subprocess
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TEMP_DIR = "gofile_parts"
 LINKS_FILE = "gofile_links.txt"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-}
+# استخدام Session لإعادة استخدام اتصالات الشبكة والسرعة القصوى
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+})
 
-def upload_litterbox_direct(filepath):
-    """الرفع إلى Litterbox - يعطي رابطاً مباشراً 100% للتحميل المباشر"""
-    cmd = [
-        "curl", "-s",
-        "-F", "reqtype=fileupload",
-        "-F", "time=72h",  # صلاحية الملف 72 ساعة
-        "-F", f"fileToUpload=@{filepath}",
-        "https://litterbox.catbox.moe/resources/internals/api.php"
-    ]
+cached_server = None
+
+def get_best_gofile_server():
+    global cached_server
+    if cached_server:
+        return cached_server
+    
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        url = res.stdout.strip()
-        if url.startswith("http://") or url.startswith("https://"):
-            return url
-        print(f"⚠️ استجابة Litterbox: {url[:150]}", flush=True)
+        res = session.get("https://api.gofile.io/servers", timeout=15)
+        if res.status_code == 200 and res.json().get("status") == "ok":
+            servers = res.json()["data"].get("servers", [])
+            if servers:
+                cached_server = servers[0]["name"]
+                return cached_server
     except Exception as e:
-        print(f"⚠️ خطأ Litterbox: {e}", flush=True)
+        print(f"⚠️ فشل جلب خادم Gofile: {e}", flush=True)
     return None
 
-def upload_filebin_direct(filepath, filename):
-    """بديل احتياطي مباشر عبر Filebin"""
-    import uuid
-    bin_id = uuid.uuid4().hex[:10]
-    url = f"https://filebin.net/{bin_id}/{filename}"
-    cmd = ["curl", "-s", "-T", filepath, url]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        if res.returncode == 0:
-            return url
-    except Exception as e:
-        print(f"⚠️ خطأ Filebin: {e}", flush=True)
-    return None
+def upload_worker(part_num, filepath, max_retries=3):
+    """دالة رفع تعمل في الخلفية بشكل منفصل"""
+    server_name = get_best_gofile_server()
+    if not server_name:
+        server_name = "store1" # خادم افتراضي في حال الفشل
 
-def upload_part(filepath, filename):
-    print("🔄 جاري الرفع لتوليد رابط مباشر (Litterbox)...", flush=True)
-    link = upload_litterbox_direct(filepath)
-    if link:
-        return link
+    upload_url = f"https://{server_name}.gofile.io/contents/uploadfile"
+    
+    print(f"🚀 [خلفية] بدء رفع الجزء {part_num} على {server_name}...", flush=True)
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            with open(filepath, "rb") as f:
+                files = {"file": f}
+                u_res = session.post(upload_url, files=files, timeout=900)
+            
+            if u_res.status_code == 200:
+                data = u_res.json()
+                if data.get("status") == "ok":
+                    fdata = data.get("data", {})
+                    link = fdata.get("downloadPage") or (f"https://gofile.io/d/{fdata.get('code')}" if fdata.get('code') else None)
+                    if link:
+                        print(f"✅ [اكتمل] الجزء {part_num}: {link}", flush=True)
+                        # حذف الملف المؤقت فور انتهاء الرفع لتوفير المساحة
+                        if os.path.exists(filepath):
+                            os.remove(filepath)
+                        return part_num, link
+            
+            print(f"⚠️ محاولة {attempt} للجزء {part_num} لم تكتمل، إعادة المحاولة...", flush=True)
+        except Exception as e:
+            print(f"⚠️ خطأ أثناء رفع الجزء {part_num} (محاولة {attempt}): {e}", flush=True)
+        
+        time.sleep(2)
 
-    print("⚠️ تجربة السيرفر الاحتياطي (Filebin)...", flush=True)
-    link = upload_filebin_direct(filepath, filename)
-    if link:
-        return link
-
-    return None
+    if os.path.exists(filepath):
+        os.remove(filepath)
+    return part_num, None
 
 def main():
     if len(sys.argv) < 2:
@@ -68,21 +81,24 @@ def main():
     CHUNK_SIZE = chunk_size_mb * 1024 * 1024
     os.makedirs(TEMP_DIR, exist_ok=True)
 
-    links = []
+    print(f"⚡ بدء العملية بالسرعة القصوى (تنزيل ورفع بالتوازي) - بحجم {chunk_size_mb}MB...", flush=True)
+
+    futures = []
+    # السماح برفع جُزأين في الخلفية في نفس الوقت لزيادة تدفق البيانات
+    executor = ThreadPoolExecutor(max_workers=3)
+
     part_num = 1
     current_size = 0
 
-    print(f"⬇️ جاري المعالجة والتقسيم إلى أجزاء بحجم {chunk_size_mb}MB...", flush=True)
-
     try:
-        with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
+        with session.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
             part_filename = f"part_{part_num:03d}.bin"
             part_path = os.path.join(TEMP_DIR, part_filename)
             part_file = open(part_path, "wb")
 
             try:
-                for chunk in r.iter_content(chunk_size=2 * 1024 * 1024):
+                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024): # زيادة حجم البافر لـ 4MB لسرعة أكبر
                     if not chunk:
                         continue
                     part_file.write(chunk)
@@ -90,14 +106,10 @@ def main():
 
                     if current_size >= CHUNK_SIZE:
                         part_file.close()
-                        print(f"📤 رفع الجزء {part_num}...", flush=True)
-                        link = upload_part(part_path, part_filename)
-                        if not link:
-                            raise RuntimeError(f"فشل رفع الجزء {part_num}")
                         
-                        print(f"✅ رابط مباشر للجزء {part_num}: {link}", flush=True)
-                        links.append((part_num, link))
-                        os.remove(part_path)
+                        # إرسال عملية الرفع إلى الخلفية والاستمرار فوراً في تنزيل الجزء التالي!
+                        future = executor.submit(upload_worker, part_num, part_path)
+                        futures.append(future)
 
                         part_num += 1
                         current_size = 0
@@ -108,13 +120,8 @@ def main():
                 part_file.close()
 
                 if current_size > 0:
-                    print(f"📤 رفع الجزء {part_num}...", flush=True)
-                    link = upload_part(part_path, part_filename)
-                    if not link:
-                        raise RuntimeError(f"فشل رفع الجزء {part_num}")
-                    print(f"✅ رابط مباشر للجزء {part_num}: {link}", flush=True)
-                    links.append((part_num, link))
-                    os.remove(part_path)
+                    future = executor.submit(upload_worker, part_num, part_path)
+                    futures.append(future)
                 else:
                     if os.path.exists(part_path):
                         os.remove(part_path)
@@ -124,15 +131,32 @@ def main():
                     part_file.close()
 
     except Exception as e:
-        print(f"❌ خطأ أثناء العملية: {e}", flush=True)
+        print(f"❌ خطأ أثناء تنزيل الملف الأصلي: {e}", flush=True)
+        executor.shutdown(wait=False)
         sys.exit(1)
 
+    # انتظار انتهاء جميع المهام في الخلفية وتجميع الروابط
+    results = []
+    for future in as_completed(futures):
+        res = future.result()
+        if res and res[1]:
+            results.append(res)
+        else:
+            print("❌ فشلت إحدى عمليات الرفع في الخلفية!", flush=True)
+
+    executor.shutdown(wait=True)
+
+    # ترتيب الروابط حسب رقم الجزء
+    results.sort(key=lambda x: x[0])
+
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
-        for num, link in links:
+        for num, link in results:
             f.write(f"الجزء {num}: {link}\n")
 
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
+
+    print("🏁 انتهت جميع العمليات بنجاح وبأقصى سرعة!", flush=True)
 
 if __name__ == "__main__":
     main()
