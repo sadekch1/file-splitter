@@ -9,15 +9,14 @@ import requests
 TEMP_DIR = "gofile_parts"
 LINKS_FILE = "gofile_links.txt"
 
-# هيدر مخصص لمنع تصنيف الطلب كـ Spam
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
 def upload_litterbox_safe(filepath, filename, max_retries=5):
-    """رفع آمن مع نظام الانتظار التراكمي لتفادي الحظر"""
+    """رفع الملف إلى Litterbox مع معالجة ذكية لحظر Cloudflare"""
     cmd = [
-        "curl", "-s",
+        "curl", "-s", "-L",
         "-A", HEADERS["User-Agent"],
         "-F", "reqtype=fileupload",
         "-F", "time=72h",
@@ -25,29 +24,28 @@ def upload_litterbox_safe(filepath, filename, max_retries=5):
         "https://litterbox.catbox.moe/resources/internals/api.php"
     ]
 
-    wait_time = 15  # البداية بانتظار 15 ثانية عند حدوث مشكلة
-
     for attempt in range(1, max_retries + 1):
         try:
-            print(f"🔄 محاولة الرفع ({attempt}/{max_retries})...", flush=True)
+            print(f"🔄 محاولة الرفع على Litterbox ({attempt}/{max_retries})...", flush=True)
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
             url = res.stdout.strip()
             
+            # التأكد من الحصول على رابط مباشر وليس صفحة خطأ HTML
             if url.startswith("http"):
                 print("✅ تم الرفع بنجاح دون حظر!", flush=True)
                 return url
             else:
-                print(f"⚠️ السيرفر مشغول أو يفرض حظراً مؤقتاً. استجابة: {url[:50]}", flush=True)
+                print(f"⚠️ استجابة غير معتادة (حظر مؤقت من السيرفر).", flush=True)
 
         except Exception as e:
             print(f"⚠️ خطأ في الاتصال: {e}", flush=True)
 
         if attempt < max_retries:
-            print(f"⏳ انتظار حماية للحظر لمدة {wait_time} ثانية قبل الإعادة...", flush=True)
+            wait_time = 45  # انتظار 45 ثانية لتصفير عداد الحظر
+            print(f"⏳ جاري الانتظار {wait_time} ثانية لتصفير عداد الحظر لدى السيرفر...", flush=True)
             time.sleep(wait_time)
-            wait_time *= 2  # مضاعفة الوقت (15s -> 30s -> 60s -> 120s)
 
-    raise RuntimeError("تعذر الرفع بعد استنفاد محاولات الحماية")
+    raise RuntimeError("فشل الرفع على Litterbox بعد عدة محاولات")
 
 def main():
     if len(sys.argv) < 2:
@@ -55,8 +53,8 @@ def main():
         sys.exit(1)
 
     url = sys.argv[1]
-    # افتراضياً 1000MB (1GB) لتقليل عدد الأجزاء والابتعاد عن الحظر
-    chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
+    # تثبيت الحجم الإفتراضي على 200MB بناءً على طلبك
+    chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 200
     CHUNK_SIZE = chunk_size_mb * 1024 * 1024
     os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -64,7 +62,7 @@ def main():
     part_num = 1
     current_size = 0
 
-    print(f"⬇️ جاري المعالجة بحجم جزء {chunk_size_mb}MB (نظام أمان Litterbox)...", flush=True)
+    print(f"⬇️ جاري المعالجة بحجم جزء {chunk_size_mb}MB (Litterbox حصراً مع نظام التبريد)...", flush=True)
 
     try:
         with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
@@ -89,9 +87,12 @@ def main():
                         links.append((part_num, link))
                         os.remove(part_path)
 
-                        # استراحة أمان 10 ثوانٍ بين كل جزء
-                        print("💤 استراحة آمنة لمنع الحظر...", flush=True)
-                        time.sleep(10)
+                        # نظام التبريد الدوري: راحة 45 ثانية بعد كل 3 أجزاء، و 10 ثوانٍ بين الأجزاء العادية
+                        if part_num % 3 == 0:
+                            print("💤 [استراحة تبريد الـ IP] انتظار 45 ثانية لتفادي الحظر نهائياً...", flush=True)
+                            time.sleep(45)
+                        else:
+                            time.sleep(10)
 
                         part_num += 1
                         current_size = 0
@@ -119,6 +120,7 @@ def main():
         print(f"❌ خطأ أثناء العملية: {e}", flush=True)
         sys.exit(1)
 
+    # حفظ الروابط
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
         for num, link in links:
             f.write(f"الجزء {num}: {link}\n")
