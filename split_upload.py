@@ -1,77 +1,56 @@
 #!/usr/bin/env python3
 import sys
 import os
-import json
 import shutil
 import subprocess
+import uuid
 import requests
 
 TEMP_DIR = "gofile_parts"
 LINKS_FILE = "gofile_links.txt"
 
+# إنشاء حاوية خفيفة وفريدة خصيصاً لملفاتك على Filebin
+BIN_ID = uuid.uuid4().hex[:12]
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 
-def upload_pixeldrain_curl(filepath, filename):
-    """رفع مباشر إلى Pixeldrain باستخدام curl -T لتفادي أخطاء SSL وذاكرة Python"""
-    url = f"https://pixeldrain.com/api/file/{filename}"
-    cmd = [
-        "curl", "-s", "-w", "\n%{http_code}",
-        "-T", filepath,
-        url
-    ]
+def upload_filebin_direct(filepath, filename):
+    """رفع عبر Filebin - يوفر رابط تنزيل مباشر وصريح بدون صفحة تحميل"""
+    url = f"https://filebin.net/{BIN_ID}/{filename}"
+    cmd = ["curl", "-s", "-T", filepath, url]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        lines = res.stdout.strip().splitlines()
-        if lines:
-            http_code = lines[-1]
-            body = "".join(lines[:-1])
-            
-            if http_code in ["200", "201"]:
-                data = json.loads(body)
-                if data.get("success"):
-                    file_id = data.get("id")
-                    return f"https://pixeldrain.com/u/{file_id}"
-            print(f"⚠️ Pixeldrain (رمز الاستجابة {http_code}): {body[:100]}", flush=True)
+        if res.returncode == 0:
+            # الرابط الناتج مباشر 100% للتحميل الفوري
+            return url
+        print(f"⚠️ استجابة Filebin: {res.stderr[:100]}", flush=True)
     except Exception as e:
-        print(f"⚠️ خطأ Pixeldrain: {e}", flush=True)
+        print(f"⚠️ خطأ Filebin: {e}", flush=True)
     return None
 
-def upload_gofile_curl(filepath):
-    """بديل احتياطي سريح ومستقر: Gofile عبر curl"""
+def upload_temp_sh_direct(filepath):
+    """بديل احتياطي يوفر رابط تنزيل مباشر"""
+    cmd = ["curl", "-s", "-F", f"file=@{filepath}", "https://temp.sh/upload"]
     try:
-        # جلب الخادم المناسب
-        res_s = subprocess.run(["curl", "-s", "https://api.gofile.io/servers"], capture_output=True, text=True, timeout=30)
-        data_s = json.loads(res_s.stdout)
-        
-        if data_s.get("status") == "ok":
-            servers = data_s["data"]["servers"]
-            if servers:
-                server_name = servers[0]["name"]
-                upload_url = f"https://{server_name}.gofile.io/contents/uploadfile"
-                
-                cmd = [
-                    "curl", "-s",
-                    "-F", f"file=@{filepath}",
-                    upload_url
-                ]
-                res_u = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-                data_u = json.loads(res_u.stdout)
-                if data_u.get("status") == "ok":
-                    return data_u["data"]["downloadPage"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        url = res.stdout.strip()
+        if url.startswith("http://") or url.startswith("https://"):
+            return url
+        print(f"⚠️ استجابة temp.sh: {url[:100]}", flush=True)
     except Exception as e:
-        print(f"⚠️ خطأ Gofile: {e}", flush=True)
+        print(f"⚠️ خطأ temp.sh: {e}", flush=True)
     return None
 
 def upload_part(filepath, filename):
-    print("🔄 جاري الرفع على Pixeldrain (عبر curl المباشر)...", flush=True)
-    link = upload_pixeldrain_curl(filepath, filename)
+    print("🔄 جاري الرفع لتوليد رابط مباشر...", flush=True)
+    link = upload_filebin_direct(filepath, filename)
     if link:
         return link
 
-    print("⚠️ تجربة السيرفر الاحتياطي (Gofile)...", flush=True)
-    link = upload_gofile_curl(filepath)
+    print("⚠️ تجربة السيرفر الاحتياطي ذات الروابط المباشرة (temp.sh)...", flush=True)
+    link = upload_temp_sh_direct(filepath)
     if link:
         return link
 
@@ -91,7 +70,7 @@ def main():
     part_num = 1
     current_size = 0
 
-    print(f"⬇️ جاري المعالجة والتقسيم إلى أجزاء بحجم {chunk_size_mb}MB...", flush=True)
+    print(f"⬇️ جاري المعالجة والتقسيم إلى أجزاء بحجم {chunk_size_mb}MB (روابط تنزيل مباشرة)...", flush=True)
 
     try:
         with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
@@ -114,7 +93,7 @@ def main():
                         if not link:
                             raise RuntimeError(f"فشل رفع الجزء {part_num}")
                         
-                        print(f"✅ الجزء {part_num}: {link}", flush=True)
+                        print(f"✅ رابط مباشر للجزء {part_num}: {link}", flush=True)
                         links.append((part_num, link))
                         os.remove(part_path)
 
@@ -131,7 +110,7 @@ def main():
                     link = upload_part(part_path, part_filename)
                     if not link:
                         raise RuntimeError(f"فشل رفع الجزء {part_num}")
-                    print(f"✅ الجزء {part_num}: {link}", flush=True)
+                    print(f"✅ رابط مباشر للجزء {part_num}: {link}", flush=True)
                     links.append((part_num, link))
                     os.remove(part_path)
                 else:
