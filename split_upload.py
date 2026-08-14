@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-سكربت تحميل + تقسيم + رفع لـ Catbox.moe
+سكربت تحميل + تقسيم + رفع لـ 0x0.st
 الاستخدام: python split_upload.py <رابط_التحميل_المباشر>
 """
 
@@ -10,7 +10,7 @@ import math
 import requests
 
 TEMP_DIR = "gofile_parts"
-UPLOAD_URL = "https://catbox.moe/user/api.php"
+UPLOAD_URL = "https://0x0.st"
 LINKS_FILE = "gofile_links.txt"
 UPLOAD_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -24,15 +24,14 @@ def upload_part(filepath, retries=3):
             with open(filepath, "rb") as f:
                 resp = requests.post(
                     UPLOAD_URL,
-                    data={"reqtype": "fileupload"},
-                    files={"fileToUpload": f},
+                    files={"file": f},
                     headers=UPLOAD_HEADERS,
                     timeout=180,
                 )
             resp.raise_for_status()
             link = resp.text.strip()
             if not link.startswith("http"):
-                raise RuntimeError(f"استجابة غير متوقعة من Catbox: {link}")
+                raise RuntimeError(f"استجابة غير متوقعة من 0x0.st: {link}")
             return link
         except Exception as e:
             last_err = e
