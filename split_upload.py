@@ -2,58 +2,76 @@
 import sys
 import os
 import shutil
-import subprocess
-import uuid
 import requests
 
 TEMP_DIR = "gofile_parts"
 LINKS_FILE = "gofile_links.txt"
 
-# إنشاء حاوية خفيفة وفريدة خصيصاً لملفاتك على Filebin
-BIN_ID = uuid.uuid4().hex[:12]
-
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 
-def upload_filebin_direct(filepath, filename):
-    """رفع عبر Filebin - يوفر رابط تنزيل مباشر وصريح بدون صفحة تحميل"""
-    url = f"https://filebin.net/{BIN_ID}/{filename}"
-    cmd = ["curl", "-s", "-T", filepath, url]
+def get_gofile_account():
+    """إنشاء حساب مجاني تلقائي لجلب Token يسمح باستخراج الروابط المباشرة"""
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        if res.returncode == 0:
-            # الرابط الناتج مباشر 100% للتحميل الفوري
-            return url
-        print(f"⚠️ استجابة Filebin: {res.stderr[:100]}", flush=True)
+        r = requests.post("https://api.gofile.io/accounts", headers=HEADERS, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") == "ok":
+                return data["data"]["token"]
     except Exception as e:
-        print(f"⚠️ خطأ Filebin: {e}", flush=True)
+        print(f"⚠️ خطأ أثناء جلب Token لـ Gofile: {e}", flush=True)
     return None
 
-def upload_temp_sh_direct(filepath):
-    """بديل احتياطي يوفر رابط تنزيل مباشر"""
-    cmd = ["curl", "-s", "-F", f"file=@{filepath}", "https://temp.sh/upload"]
+def get_gofile_server():
+    """جلب سيرفر الرفع المتاح"""
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        url = res.stdout.strip()
-        if url.startswith("http://") or url.startswith("https://"):
-            return url
-        print(f"⚠️ استجابة temp.sh: {url[:100]}", flush=True)
+        r = requests.get("https://api.gofile.io/servers", headers=HEADERS, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") == "ok" and data["data"]["servers"]:
+                return data["data"]["servers"][0]["name"]
     except Exception as e:
-        print(f"⚠️ خطأ temp.sh: {e}", flush=True)
+        print(f"⚠️ خطأ أثناء جلب سيرفر Gofile: {e}", flush=True)
     return None
 
-def upload_part(filepath, filename):
-    print("🔄 جاري الرفع لتوليد رابط مباشر...", flush=True)
-    link = upload_filebin_direct(filepath, filename)
-    if link:
-        return link
+def upload_gofile_direct(filepath, token, server):
+    """رفع الملف ثم استخراج الرابط المباشر الصريح منه"""
+    try:
+        upload_url = f"https://{server}.gofile.io/contents/uploadfile"
+        payload = {}
+        if token:
+            payload["token"] = token
 
-    print("⚠️ تجربة السيرفر الاحتياطي ذات الروابط المباشرة (temp.sh)...", flush=True)
-    link = upload_temp_sh_direct(filepath)
-    if link:
-        return link
+        with open(filepath, "rb") as f:
+            files = {"file": f}
+            res = requests.post(upload_url, data=payload, files=files, headers=HEADERS, timeout=900)
 
+        if res.status_code == 200:
+            res_data = res.json()
+            if res_data.get("status") == "ok":
+                file_id = res_data["data"]["fileId"]
+                parent_folder = res_data["data"]["parentFolder"]
+
+                # استخراج الرابط المباشر عبر API المحتوى
+                if token and parent_folder:
+                    details_url = f"https://api.gofile.io/contents/{parent_folder}?token={token}"
+                    det_res = requests.get(details_url, headers=HEADERS, timeout=30)
+                    if det_res.status_code == 200:
+                        det_data = det_res.json()
+                        if det_data.get("status") == "ok":
+                            children = det_data["data"].get("children", {})
+                            if file_id in children:
+                                direct_link = children[file_id].get("link")
+                                if direct_link:
+                                    return direct_link
+
+                # رابط احتياطي في حال تعذر جلب المباشر
+                return res_data["data"].get("downloadPage")
+        else:
+            print(f"⚠️ استجابة Gofile ({res.status_code}): {res.text[:100]}", flush=True)
+    except Exception as e:
+        print(f"⚠️ استثناء أثناء رفع Gofile: {e}", flush=True)
     return None
 
 def main():
@@ -66,11 +84,19 @@ def main():
     CHUNK_SIZE = chunk_size_mb * 1024 * 1024
     os.makedirs(TEMP_DIR, exist_ok=True)
 
+    print("🔑 جاري تحضير حساب وسيرفر Gofile...", flush=True)
+    token = get_gofile_account()
+    server = get_gofile_server()
+
+    if not server:
+        print("❌ فشل في الاتصال بسيرفرات Gofile")
+        sys.exit(1)
+
     links = []
     part_num = 1
     current_size = 0
 
-    print(f"⬇️ جاري المعالجة والتقسيم إلى أجزاء بحجم {chunk_size_mb}MB (روابط تنزيل مباشرة)...", flush=True)
+    print(f"⬇️ جاري معالجة الملف وتقسيمه إلى أجزاء بحجم {chunk_size_mb}MB...", flush=True)
 
     try:
         with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
@@ -88,8 +114,8 @@ def main():
 
                     if current_size >= CHUNK_SIZE:
                         part_file.close()
-                        print(f"📤 رفع الجزء {part_num}...", flush=True)
-                        link = upload_part(part_path, part_filename)
+                        print(f"📤 رفع الجزء {part_num} واستخراج الرابط المباشر...", flush=True)
+                        link = upload_gofile_direct(part_path, token, server)
                         if not link:
                             raise RuntimeError(f"فشل رفع الجزء {part_num}")
                         
@@ -106,8 +132,8 @@ def main():
                 part_file.close()
 
                 if current_size > 0:
-                    print(f"📤 رفع الجزء {part_num}...", flush=True)
-                    link = upload_part(part_path, part_filename)
+                    print(f"📤 رفع الجزء {part_num} واستخراج الرابط المباشر...", flush=True)
+                    link = upload_gofile_direct(part_path, token, server)
                     if not link:
                         raise RuntimeError(f"فشل رفع الجزء {part_num}")
                     print(f"✅ رابط مباشر للجزء {part_num}: {link}", flush=True)
