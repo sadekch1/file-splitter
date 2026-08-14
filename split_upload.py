@@ -1,127 +1,119 @@
 #!/usr/bin/env python3
-"""
-سكربت تحميل + تقسيم + رفع لـ 0x0.st
-الاستخدام: python split_upload.py <رابط_التحميل_المباشر>
-"""
-
 import sys
 import os
-import math
+import shutil
 import requests
 
 TEMP_DIR = "gofile_parts"
-UPLOAD_URL = "https://0x0.st"
 LINKS_FILE = "gofile_links.txt"
-UPLOAD_HEADERS = {
+
+HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-
-def upload_part(filepath, retries=3):
+def upload_to_pixeldrain(filepath, filename, retries=3):
+    """رفع الملف إلى Pixeldrain الذي يتميز بالسرعة وعدم حظر سيرفرات GitHub"""
+    url = f"https://pixeldrain.com/api/file/{filename}"
     last_err = None
+    
     for attempt in range(1, retries + 1):
         try:
             with open(filepath, "rb") as f:
-                resp = requests.post(
-                    UPLOAD_URL,
-                    files={"file": f},
-                    headers=UPLOAD_HEADERS,
-                    timeout=180,
+                # استخدام PUT لرفع مباشر ومستقر للملفات الكبيرة
+                resp = requests.put(
+                    url,
+                    data=f,
+                    headers=HEADERS,
+                    timeout=600  # مهلة 10 دقائق
                 )
             resp.raise_for_status()
-            link = resp.text.strip()
-            if not link.startswith("http"):
-                raise RuntimeError(f"استجابة غير متوقعة من 0x0.st: {link}")
-            return link
+            data = resp.json()
+            
+            if data.get("success"):
+                file_id = data.get("id")
+                return f"https://pixeldrain.com/u/{file_id}"
+            else:
+                raise RuntimeError(f"استجابة غير متوقعة: {data}")
+                
         except Exception as e:
             last_err = e
-            print(f"\n⚠️  محاولة {attempt}/{retries} فشلت: {e}")
-    raise RuntimeError(f"فشل رفع {filepath} بعد {retries} محاولات: {last_err}")
-
-
-def format_size(num_bytes):
-    return f"{num_bytes / (1024 * 1024):.2f} MB"
-
+            print(f"⚠️ محاولة رفع {attempt}/{retries} فشلت: {e}", flush=True)
+            
+    raise RuntimeError(f"فشل الرفع بعد {retries} محاولات: {last_err}")
 
 def main():
     if len(sys.argv) < 2:
-        print("الاستخدام: python split_upload.py <رابط_التحميل_المباشر> [حجم_الجزء_بالميغابايت]")
+        print("❌ يرجى تزويد رابط الملف")
         sys.exit(1)
 
     url = sys.argv[1]
-    chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 190
+    chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 200
     CHUNK_SIZE = chunk_size_mb * 1024 * 1024
     os.makedirs(TEMP_DIR, exist_ok=True)
-
-    print(f"⬇️  بدء التحميل من:\n{url}\n")
 
     links = []
     part_num = 1
     current_size = 0
-    downloaded_total = 0
 
-    part_path = os.path.join(TEMP_DIR, f"part_{part_num:03d}")
-    part_file = open(part_path, "wb")
+    print(f"⬇️ جاري بدء تحميل الملف وتجزئته بحجم {chunk_size_mb} ميجابايت...", flush=True)
 
     try:
-        with requests.get(url, stream=True, timeout=60) as r:
+        with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
             r.raise_for_status()
-            total_size = int(r.headers.get("content-length", 0))
-            if total_size:
-                total_parts = math.ceil(total_size / CHUNK_SIZE)
-                print(f"📦 الحجم الكلي: {format_size(total_size)} — سيقسم لـ ~{total_parts} جزء\n")
+            part_filename = f"part_{part_num:03d}.bin"
+            part_path = os.path.join(TEMP_DIR, part_filename)
+            part_file = open(part_path, "wb")
 
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if not chunk:
-                    continue
-                part_file.write(chunk)
-                current_size += len(chunk)
-                downloaded_total += len(chunk)
-                print(f"\r⬇️  تم تحميل: {format_size(downloaded_total)}", end="", flush=True)
+            try:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    part_file.write(chunk)
+                    current_size += len(chunk)
 
-                if current_size >= CHUNK_SIZE:
-                    part_file.close()
-                    print(f"\n📤 رفع الجزء {part_num} ({format_size(current_size)})...")
-                    link = upload_part(part_path)
-                    print(f"✅ رابط الجزء {part_num}: {link}")
+                    if current_size >= CHUNK_SIZE:
+                        part_file.close()
+                        print(f"📤 جاري رفع الجزء {part_num} إلى Pixeldrain...", flush=True)
+                        link = upload_to_pixeldrain(part_path, part_filename)
+                        
+                        # الرمز ✅ ضروري ليتعرف عليه سكربت Termux لقراءة التقدم
+                        print(f"✅ الجزء {part_num}: {link}", flush=True)
+                        links.append((part_num, link))
+                        os.remove(part_path)
+
+                        part_num += 1
+                        current_size = 0
+                        part_filename = f"part_{part_num:03d}.bin"
+                        part_path = os.path.join(TEMP_DIR, part_filename)
+                        part_file = open(part_path, "wb")
+
+                part_file.close()
+
+                if current_size > 0:
+                    print(f"📤 جاري رفع الجزء {part_num} إلى Pixeldrain...", flush=True)
+                    link = upload_to_pixeldrain(part_path, part_filename)
+                    print(f"✅ الجزء {part_num}: {link}", flush=True)
                     links.append((part_num, link))
                     os.remove(part_path)
+                else:
+                    if os.path.exists(part_path):
+                        os.remove(part_path)
 
-                    part_num += 1
-                    current_size = 0
-                    part_path = os.path.join(TEMP_DIR, f"part_{part_num:03d}")
-                    part_file = open(part_path, "wb")
-
-        part_file.close()
-
-        if current_size > 0:
-            print(f"\n📤 رفع الجزء الأخير {part_num} ({format_size(current_size)})...")
-            link = upload_part(part_path)
-            print(f"✅ رابط الجزء {part_num}: {link}")
-            links.append((part_num, link))
-            os.remove(part_path)
-        else:
-            os.remove(part_path)
+            finally:
+                if not part_file.closed:
+                    part_file.close()
 
     except Exception as e:
-        part_file.close()
-        print(f"\n❌ خطأ: {e}")
+        print(f"❌ خطأ أثناء العملية: {e}", flush=True)
         sys.exit(1)
 
+    # حفظ الروابط في الملف النهائي
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
         for num, link in links:
             f.write(f"الجزء {num}: {link}\n")
 
-    print("\n\n🎉 انتهى! جميع الروابط:")
-    for num, link in links:
-        print(f"  الجزء {num}: {link}")
-    print(f"\n💾 الروابط محفوظة أيضًا في: {LINKS_FILE}")
-
-    try:
-        os.rmdir(TEMP_DIR)
-    except OSError:
-        pass
-
+    if os.path.exists(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
 if __name__ == "__main__":
     main()
