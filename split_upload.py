@@ -1,60 +1,77 @@
 #!/usr/bin/env python3
 import sys
 import os
+import json
 import shutil
+import subprocess
 import requests
 
 TEMP_DIR = "gofile_parts"
 LINKS_FILE = "gofile_links.txt"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 
-def upload_pixeldrain(filepath):
-    """الرفع إلى Pixeldrain (يدعم حزم كبيرة ومستقر جداً مع GitHub Actions)"""
+def upload_pixeldrain_curl(filepath, filename):
+    """رفع مباشر إلى Pixeldrain باستخدام curl -T لتفادي أخطاء SSL وذاكرة Python"""
+    url = f"https://pixeldrain.com/api/file/{filename}"
+    cmd = [
+        "curl", "-s", "-w", "\n%{http_code}",
+        "-T", filepath,
+        url
+    ]
     try:
-        url = "https://pixeldrain.com/api/file"
-        with open(filepath, "rb") as f:
-            res = requests.post(url, files={"file": f}, timeout=600)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        lines = res.stdout.strip().splitlines()
+        if lines:
+            http_code = lines[-1]
+            body = "".join(lines[:-1])
             
-        if res.status_code == 200 or res.status_code == 201:
-            data = res.json()
-            if data.get("success"):
-                file_id = data.get("id")
-                return f"https://pixeldrain.com/u/{file_id}"
-        print(f"⚠️ Pixeldrain response ({res.status_code}): {res.text[:100]}", flush=True)
+            if http_code in ["200", "201"]:
+                data = json.loads(body)
+                if data.get("success"):
+                    file_id = data.get("id")
+                    return f"https://pixeldrain.com/u/{file_id}"
+            print(f"⚠️ Pixeldrain (رمز الاستجابة {http_code}): {body[:100]}", flush=True)
     except Exception as e:
-        print(f"⚠️ استثناء Pixeldrain: {e}", flush=True)
+        print(f"⚠️ خطأ Pixeldrain: {e}", flush=True)
     return None
 
-def upload_tmpfiles(filepath):
-    """بديل احتياطي: Tmpfiles.org"""
+def upload_gofile_curl(filepath):
+    """بديل احتياطي سريح ومستقر: Gofile عبر curl"""
     try:
-        url = "https://tmpfiles.org/api/v1/upload"
-        with open(filepath, "rb") as f:
-            res = requests.post(url, files={"file": f}, timeout=600)
-            
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("status") == "success":
-                raw_url = data["data"]["url"]
-                # تحويل الرابط إلى رابط تنزيل مباشر
-                direct_url = raw_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
-                return direct_url
-        print(f"⚠️ Tmpfiles response ({res.status_code}): {res.text[:100]}", flush=True)
+        # جلب الخادم المناسب
+        res_s = subprocess.run(["curl", "-s", "https://api.gofile.io/servers"], capture_output=True, text=True, timeout=30)
+        data_s = json.loads(res_s.stdout)
+        
+        if data_s.get("status") == "ok":
+            servers = data_s["data"]["servers"]
+            if servers:
+                server_name = servers[0]["name"]
+                upload_url = f"https://{server_name}.gofile.io/contents/uploadfile"
+                
+                cmd = [
+                    "curl", "-s",
+                    "-F", f"file=@{filepath}",
+                    upload_url
+                ]
+                res_u = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+                data_u = json.loads(res_u.stdout)
+                if data_u.get("status") == "ok":
+                    return data_u["data"]["downloadPage"]
     except Exception as e:
-        print(f"⚠️ استثناء Tmpfiles: {e}", flush=True)
+        print(f"⚠️ خطأ Gofile: {e}", flush=True)
     return None
 
 def upload_part(filepath, filename):
-    print("🔄 جاري الرفع على Pixeldrain...", flush=True)
-    link = upload_pixeldrain(filepath)
+    print("🔄 جاري الرفع على Pixeldrain (عبر curl المباشر)...", flush=True)
+    link = upload_pixeldrain_curl(filepath, filename)
     if link:
         return link
-        
-    print("⚠️ تجربة السيرفر الاحتياطي (Tmpfiles)...", flush=True)
-    link = upload_tmpfiles(filepath)
+
+    print("⚠️ تجربة السيرفر الاحتياطي (Gofile)...", flush=True)
+    link = upload_gofile_curl(filepath)
     if link:
         return link
 
@@ -74,7 +91,7 @@ def main():
     part_num = 1
     current_size = 0
 
-    print(f"⬇️ جاري معالجة الملف وتقسيمه إلى أجزاء بحجم {chunk_size_mb}MB...", flush=True)
+    print(f"⬇️ جاري المعالجة والتقسيم إلى أجزاء بحجم {chunk_size_mb}MB...", flush=True)
 
     try:
         with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
