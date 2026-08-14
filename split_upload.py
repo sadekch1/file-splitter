@@ -13,9 +13,19 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 }
 
-def upload_litterbox(filepath, filename):
-    """رفع الملف إلى Litterbox (72 ساعة)"""
-    try:
+# قائمة بروكسيات مجانية لتجاوز حظر Cloudflare على GitHub IPs
+PROXIES = [
+    "", # المحاولة الأولى بدون بروكسي
+    "--proxy http://103.152.112.162:80",
+    "--proxy http://43.134.68.204:3128",
+    "--proxy http://185.199.229.156:7492"
+]
+
+def upload_litterbox_safe(filepath, filename, max_retries=5):
+    """رفع الملف إلى Litterbox باستخدام البروكسي لتجاوز حظر Cloudflare"""
+    for attempt in range(1, max_retries + 1):
+        proxy_cmd = PROXIES[(attempt - 1) % len(PROXIES)]
+        
         cmd = [
             "curl", "-s", "-L",
             "-A", HEADERS["User-Agent"],
@@ -24,53 +34,29 @@ def upload_litterbox(filepath, filename):
             "-F", f"fileToUpload=@{filepath}",
             "https://litterbox.catbox.moe/resources/internals/api.php"
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        url = res.stdout.strip()
-        if url.startswith("http://") or url.startswith("https://"):
-            return url
-    except Exception as e:
-        print(f"Litterbox log: {e}", flush=True)
-    return None
+        
+        if proxy_cmd:
+            cmd.extend(proxy_cmd.split())
 
-def upload_catbox(filepath, filename):
-    """رفع الملف إلى Catbox الرسمية (روابط دائمة لأجزاء 200MB)"""
-    try:
-        cmd = [
-            "curl", "-s", "-L",
-            "-A", HEADERS["User-Agent"],
-            "-F", "reqtype=fileupload",
-            "-F", f"fileToUpload=@{filepath}",
-            "https://catbox.moe/user/api.php"
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        url = res.stdout.strip()
-        if url.startswith("http://") or url.startswith("https://"):
-            return url
-    except Exception as e:
-        print(f"Catbox log: {e}", flush=True)
-    return None
-
-def upload_part_safe(filepath, filename, max_retries=5):
-    """الرفع مع التبديل الذكي بين Litterbox و Catbox لحجم 200MB"""
-    providers = [
-        ("Litterbox", upload_litterbox),
-        ("Catbox", upload_catbox)
-    ]
-
-    for attempt in range(1, max_retries + 1):
-        for name, provider in providers:
-            print(f"🔄 محاولة الرفع عبر {name} (المحاولة {attempt}/{max_retries})...", flush=True)
-            url = provider(filepath, filename)
-            if url:
-                print(f"✅ تم الرفع بنجاح عبر {name}!", flush=True)
+        try:
+            print(f"🔄 محاولة الرفع على Litterbox ({attempt}/{max_retries})...", flush=True)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            url = res.stdout.strip()
+            
+            # التأكد من الحصول على رابط مباشر وليس صفحة خطأ HTML
+            if url.startswith("http://") or url.startswith("https://"):
+                print("✅ تم الرفع بنجاح دون حظر!", flush=True)
                 return url
-            print(f"⚠️ متعذر على {name}، تجربة السيرفر الآخر...", flush=True)
+            else:
+                print(f"⚠️ استجابة Cloudflare (حظر IP الخادم). إعادة المحاولة بمسار جديد...", flush=True)
+
+        except Exception as e:
+            print(f"⚠️ خطأ أثناء الاتصال: {e}", flush=True)
 
         if attempt < max_retries:
-            print("⏳ انتظار 30 ثانية قبل إعادة المحاولة لتجنب الحظر...", flush=True)
-            time.sleep(30)
+            time.sleep(15)
 
-    raise RuntimeError("فشل الرفع على Litterbox و Catbox بعد عدة محاولات")
+    raise RuntimeError("فشل الرفع على Litterbox بعد استنفاد كل المحاولات")
 
 def main():
     if len(sys.argv) < 2:
@@ -78,8 +64,7 @@ def main():
         sys.exit(1)
 
     url = sys.argv[1]
-    # ضبط الحجم على 190MB ليصقل الحجم النهائي تحت 200MB بالضبط مع الهيدر
-    chunk_size_mb = 190
+    chunk_size_mb = 190  # 190MB لضمان عدم تجاوز السقف مع الهيدر
     CHUNK_SIZE = chunk_size_mb * 1024 * 1024
     os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -87,7 +72,7 @@ def main():
     part_num = 1
     current_size = 0
 
-    print(f"⬇️ جاري المعالجة بحجم أجزاء آمن تحت 200MB (Litterbox / Catbox)...", flush=True)
+    print(f"⬇️ جاري المعالجة بحجم {chunk_size_mb}MB (Litterbox + تجاوز حظر Cloudflare)...", flush=True)
 
     try:
         with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
@@ -106,14 +91,13 @@ def main():
                     if current_size >= CHUNK_SIZE:
                         part_file.close()
                         print(f"📤 رفع الجزء {part_num}...", flush=True)
-                        link = upload_part_safe(part_path, part_filename)
+                        link = upload_litterbox_safe(part_path, part_filename)
                         
                         print(f"✅ الجزء {part_num}: {link}", flush=True)
                         links.append((part_num, link))
                         os.remove(part_path)
 
-                        # استراحة 15 ثانية بين كل جزء
-                        time.sleep(15)
+                        time.sleep(10)
 
                         part_num += 1
                         current_size = 0
@@ -125,7 +109,7 @@ def main():
 
                 if current_size > 0:
                     print(f"📤 رفع الجزء {part_num}...", flush=True)
-                    link = upload_part_safe(part_path, part_filename)
+                    link = upload_litterbox_safe(part_path, part_filename)
                     print(f"✅ الجزء {part_num}: {link}", flush=True)
                     links.append((part_num, link))
                     os.remove(part_path)
