@@ -17,6 +17,8 @@ jobs:
   split-upload:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    permissions:
+      contents: write
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -30,6 +32,9 @@ jobs:
         run: pip install requests
 
       - name: Run split & upload script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python split_upload.py "${{ github.event.inputs.url }}" "${{ github.event.inputs.chunk_size_mb }}"
 
       - name: Upload links file as artifact
