@@ -98,18 +98,17 @@ def ensure_release():
     return _release
 
 
-def upload_github_release_asset(filepath, part_num):
-    """Uploads a file as an asset on the shared release.
+def upload_asset_bytes(filepath, asset_name):
+    """Generic asset upload helper: uploads filepath under asset_name on the release.
     Returns (success: bool, direct_link_or_error: str)."""
     release = ensure_release()
-    filename = os.path.basename(filepath)
     start = time.time()
 
     with _upload_lock:  # GitHub release asset upload endpoint doesn't like concurrent uploads well
         with open(filepath, "rb") as f:
             r = gh_session.post(
                 release["upload_url"],
-                params={"name": filename},
+                params={"name": asset_name},
                 headers={"Content-Type": "application/octet-stream"},
                 data=f,
                 timeout=(15, 600),
@@ -120,9 +119,47 @@ def upload_github_release_asset(filepath, part_num):
         data = r.json()
         link = data.get("browser_download_url")
         if link:
-            print(f"[timing] Upload took {elapsed:.0f}s", flush=True)
+            print(f"[timing] Upload of {asset_name} took {elapsed:.0f}s", flush=True)
             return True, link
     return False, f"HTTP {r.status_code} after {elapsed:.0f}s: {r.text[:300]}"
+
+
+def upload_github_release_asset(filepath, part_num):
+    """Uploads a file as an asset on the shared release.
+    Returns (success: bool, direct_link_or_error: str)."""
+    filename = os.path.basename(filepath)
+    return upload_asset_bytes(filepath, filename)
+
+
+def upload_links_file(path, max_retries=4):
+    """Uploads the direct_links.txt file itself as a release asset, so the
+    ordered list of part links is also downloadable straight from the
+    release page. Returns the browser_download_url, or None on failure."""
+    print(f"[upload] Uploading {os.path.basename(path)} to GitHub Release...", flush=True)
+    backoff = 5.0
+    asset_name = os.path.basename(path)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            ok, result = upload_asset_bytes(path, asset_name)
+            if ok:
+                print(f"[done] {asset_name}: {result}", flush=True)
+                return result
+
+            print(f"[warn] Attempt {attempt} for {asset_name} failed: {result}", flush=True)
+            if "422" in result or "already_exists" in result.lower():
+                # Name clash - suffix a counter and retry immediately
+                asset_name = f"direct_links_{attempt}.txt"
+                continue
+        except requests.exceptions.Timeout:
+            print(f"[warn] {asset_name} attempt {attempt}: connection timed out", flush=True)
+        except Exception as e:
+            print(f"[warn] Error uploading {asset_name} (attempt {attempt}): {e}", flush=True)
+
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+    return None
 
 
 def upload_worker(part_num, filepath, max_retries=4):
@@ -313,14 +350,22 @@ def main():
         print(f"[error] Failed downloading the source file: {e}", flush=True)
         sys.exit(1)
 
+    # Sort ascending by part number so the .txt (and the printed order) is
+    # always Part 1, Part 2, Part 3, ... regardless of upload/finish order.
     results.sort(key=lambda x: x[0])
 
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
-        f.write("# GitHub Release asset links (permanent, tied to this repo's release)\n")
-        if "html_url" in _release:
-            f.write(f"# Release page: {_release['html_url']}\n")
         for num, link in results:
-            f.write(f"Part {num}: {link}\n")
+            f.write(f"{link}\n")
+
+    # Also upload the links file itself as a release asset, so anyone
+    # visiting the release page can grab the ordered list directly
+    # without needing the Actions log.
+    links_asset_url = upload_links_file(LINKS_FILE)
+    if links_asset_url:
+        print(f"[done] {LINKS_FILE}: {links_asset_url}", flush=True)
+    else:
+        print(f"[error] Failed to upload {LINKS_FILE} to the release (parts were still uploaded).", flush=True)
 
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
