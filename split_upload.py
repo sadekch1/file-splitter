@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-تنزيل ملف كبير، تقسيمه لأجزاء، ورفع كل جزء بالتوازي على خدمة
-ترجع رابط مباشر (Direct Link) بدل صفحة تحميل.
+Download a large file, split it into parts, and upload each part in
+parallel to Litterbox (litterbox.catbox.moe) - anonymous, no account
+needed, returns a real direct download link (not a landing page).
 
-الخدمات المدعومة (كلها مجانية وبدون حساب/توكن):
-  - catbox   -> https://catbox.moe        (رابط مباشر دائم)
-  - pixeldrain -> https://pixeldrain.com  (رابط مباشر دائم، حجم أكبر)
-  - 0x0      -> https://0x0.st            (رابط مباشر، الملفات مؤقتة حسب الحجم)
+All uploaded parts expire after 1 hour (Litterbox's shortest retention
+option), so make sure to download them before the link expires.
 
-الاستخدام:
-    python3 multi_upload.py <رابط الملف> [حجم_الجزء_ميجابايت] [service]
+Usage:
+    python3 multi_upload.py <file_url> [chunk_size_mb] [max_workers] [seconds_between_requests]
 
-مثال:
-    python3 multi_upload.py "https://example.com/file.zip" 200 pixeldrain
+Example:
+    python3 multi_upload.py "https://example.com/file.zip" 200
 """
 import sys
 import os
 import time
 import shutil
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import threading
-
 TEMP_DIR = "upload_parts"
 LINKS_FILE = "direct_links.txt"
+LITTERBOX_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
+LITTERBOX_TIME = "1h"  # fixed: all links expire after 1 hour
 
 session = requests.Session()
 session.headers.update({
@@ -32,15 +32,17 @@ session.headers.update({
 })
 
 # ---------------------------------------------------------------------------
-# تنظيم معدل الطلبات (rate limiting) - يمنع الوصول لحد الحظر بدل محاولة الالتفاف عليه
+# Request rate limiting - avoids tripping the service's abuse protection
+# instead of trying to bypass it.
 # ---------------------------------------------------------------------------
-MIN_SECONDS_BETWEEN_REQUESTS = 3.0  # فاصل أدنى بين أي طلبين متتاليين لنفس الخدمة
+MIN_SECONDS_BETWEEN_REQUESTS = 3.0
 _rate_lock = threading.Lock()
 _last_request_time = [0.0]
 
 
 def throttle():
-    """ينتظر الوقت اللازم قبل إرسال أي طلب جديد، لضمان عدم تجاوز معدل الخدمة."""
+    """Waits as needed before sending a new request, so we don't exceed
+    the service's request rate."""
     with _rate_lock:
         now = time.time()
         wait = MIN_SECONDS_BETWEEN_REQUESTS - (now - _last_request_time[0])
@@ -49,82 +51,46 @@ def throttle():
         _last_request_time[0] = time.time()
 
 
-# ---------------------------------------------------------------------------
-# دوال الرفع الخاصة بكل خدمة - كل واحدة ترجع (نجاح: bool, رابط_مباشر أو رسالة خطأ)
-# ---------------------------------------------------------------------------
-
-def upload_catbox(filepath):
+def upload_litterbox(filepath):
+    """Uploads a file to Litterbox with a fixed 1-hour expiry.
+    Returns (success: bool, direct_link_or_error: str)."""
     with open(filepath, "rb") as f:
         files = {"fileToUpload": f}
-        data = {"reqtype": "fileupload"}
-        r = session.post("https://catbox.moe/user/api.php", data=data, files=files, timeout=900)
+        data = {"reqtype": "fileupload", "time": LITTERBOX_TIME}
+        r = session.post(LITTERBOX_URL, data=data, files=files, timeout=900)
     if r.status_code == 200 and r.text.strip().startswith("http"):
         return True, r.text.strip()
     return False, f"HTTP {r.status_code}: {r.text[:200]}"
 
-
-def upload_pixeldrain(filepath):
-    filename = os.path.basename(filepath)
-    with open(filepath, "rb") as f:
-        r = session.post(
-            f"https://pixeldrain.com/api/file/{filename}",
-            data=f,
-            timeout=900,
-        )
-    if r.status_code in (200, 201):
-        data = r.json()
-        if data.get("success") and data.get("id"):
-            return True, f"https://pixeldrain.com/api/file/{data['id']}?download"
-    return False, f"HTTP {r.status_code}: {r.text[:200]}"
-
-
-def upload_0x0(filepath):
-    with open(filepath, "rb") as f:
-        files = {"file": f}
-        r = session.post("https://0x0.st", files=files, timeout=900)
-    if r.status_code == 200 and r.text.strip().startswith("http"):
-        return True, r.text.strip()
-    return False, f"HTTP {r.status_code}: {r.text[:200]}"
-
-
-SERVICES = {
-    "catbox": upload_catbox,
-    "pixeldrain": upload_pixeldrain,
-    "0x0": upload_0x0,
-}
-
-
-# ---------------------------------------------------------------------------
 
 def is_rate_limited(error_text):
     text = str(error_text).lower()
     return "429" in text or "rate" in text or "too many" in text
 
 
-def upload_worker(part_num, filepath, service_name, max_retries=5):
-    upload_fn = SERVICES[service_name]
-    print(f"🚀 [خلفية] بدء رفع الجزء {part_num} على {service_name}...", flush=True)
+def upload_worker(part_num, filepath, max_retries=5):
+    print(f"[background] Starting upload of part {part_num} to Litterbox ({LITTERBOX_TIME})...", flush=True)
 
-    backoff = 5.0  # ثواني - يتضاعف عند كل حظر مؤقت (429)
+    backoff = 5.0  # seconds - doubles on each rate-limit hit
 
     for attempt in range(1, max_retries + 1):
-        throttle()  # احترام الحد الأدنى بين الطلبات قبل أي محاولة
+        throttle()
         try:
-            ok, result = upload_fn(filepath)
+            ok, result = upload_litterbox(filepath)
             if ok:
-                print(f"✅ [اكتمل] الجزء {part_num}: {result}", flush=True)
+                print(f"[done] Part {part_num}: {result}", flush=True)
                 if os.path.exists(filepath):
                     os.remove(filepath)
                 return part_num, result
 
-            print(f"⚠️ محاولة {attempt} للجزء {part_num} فشلت: {result}", flush=True)
+            print(f"[warn] Attempt {attempt} for part {part_num} failed: {result}", flush=True)
             if is_rate_limited(result):
-                print(f"⏳ تم تجاوز حد الطلبات، الانتظار {backoff:.0f} ثانية قبل إعادة المحاولة...", flush=True)
+                print(f"[wait] Rate limited, waiting {backoff:.0f}s before retrying...", flush=True)
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 120)  # exponential backoff بحد أقصى دقيقتين
+                backoff = min(backoff * 2, 120)
                 continue
         except Exception as e:
-            print(f"⚠️ خطأ أثناء رفع الجزء {part_num} (محاولة {attempt}): {e}", flush=True)
+            print(f"[warn] Error uploading part {part_num} (attempt {attempt}): {e}", flush=True)
 
         time.sleep(2)
 
@@ -136,30 +102,24 @@ def upload_worker(part_num, filepath, service_name, max_retries=5):
 def main():
     if len(sys.argv) < 2:
         print(
-            "❌ الاستخدام: python3 multi_upload.py <رابط الملف> "
-            "[حجم_الجزء_ميجابايت] [service] [عدد_العمال] [فاصل_بالثواني]"
+            "Usage: python3 multi_upload.py <file_url> "
+            "[chunk_size_mb] [max_workers] [seconds_between_requests]"
         )
-        print(f"   الخدمات المتاحة: {', '.join(SERVICES.keys())}")
+        print(f"All links expire after {LITTERBOX_TIME} (Litterbox).")
         sys.exit(1)
 
     url = sys.argv[1]
     chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 200
-    service_name = sys.argv[3] if len(sys.argv) > 3 else "catbox"
-    max_workers = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+    max_workers = int(sys.argv[3]) if len(sys.argv) > 3 else 2
     global MIN_SECONDS_BETWEEN_REQUESTS
-    MIN_SECONDS_BETWEEN_REQUESTS = float(sys.argv[5]) if len(sys.argv) > 5 else MIN_SECONDS_BETWEEN_REQUESTS
-
-    if service_name not in SERVICES:
-        print(f"❌ خدمة غير معروفة: {service_name}")
-        print(f"   الخدمات المتاحة: {', '.join(SERVICES.keys())}")
-        sys.exit(1)
+    MIN_SECONDS_BETWEEN_REQUESTS = float(sys.argv[4]) if len(sys.argv) > 4 else MIN_SECONDS_BETWEEN_REQUESTS
 
     CHUNK_SIZE = chunk_size_mb * 1024 * 1024
     os.makedirs(TEMP_DIR, exist_ok=True)
 
     print(
-        f"⚡ بدء العملية - حجم الجزء {chunk_size_mb}MB - خدمة: {service_name} - "
-        f"عدد العمال المتزامنين: {max_workers} - فاصل بين الطلبات: {MIN_SECONDS_BETWEEN_REQUESTS}ث",
+        f"Starting - chunk size {chunk_size_mb}MB - service: litterbox (expires in {LITTERBOX_TIME}) - "
+        f"workers: {max_workers} - min delay between requests: {MIN_SECONDS_BETWEEN_REQUESTS}s",
         flush=True,
     )
 
@@ -185,7 +145,7 @@ def main():
 
                     if current_size >= CHUNK_SIZE:
                         part_file.close()
-                        future = executor.submit(upload_worker, part_num, part_path, service_name)
+                        future = executor.submit(upload_worker, part_num, part_path)
                         futures.append(future)
 
                         part_num += 1
@@ -197,7 +157,7 @@ def main():
                 part_file.close()
 
                 if current_size > 0:
-                    future = executor.submit(upload_worker, part_num, part_path, service_name)
+                    future = executor.submit(upload_worker, part_num, part_path)
                     futures.append(future)
                 else:
                     if os.path.exists(part_path):
@@ -208,7 +168,7 @@ def main():
                     part_file.close()
 
     except Exception as e:
-        print(f"❌ خطأ أثناء تنزيل الملف الأصلي: {e}", flush=True)
+        print(f"[error] Failed downloading the source file: {e}", flush=True)
         executor.shutdown(wait=False)
         sys.exit(1)
 
@@ -218,19 +178,20 @@ def main():
         if res and res[1]:
             results.append(res)
         else:
-            print("❌ فشلت إحدى عمليات الرفع في الخلفية!", flush=True)
+            print("[error] One of the background uploads failed!", flush=True)
 
     executor.shutdown(wait=True)
     results.sort(key=lambda x: x[0])
 
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
+        f.write(f"# Litterbox links - expire in {LITTERBOX_TIME}\n")
         for num, link in results:
-            f.write(f"الجزء {num}: {link}\n")
+            f.write(f"Part {num}: {link}\n")
 
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
-    print(f"🏁 انتهت جميع العمليات - الروابط المباشرة محفوظة في {LINKS_FILE}", flush=True)
+    print(f"[finished] All parts uploaded. Links saved to {LINKS_FILE} (expire in {LITTERBOX_TIME}).", flush=True)
 
 
 if __name__ == "__main__":
