@@ -4,21 +4,24 @@ Download a large file, split it into parts, and upload each part in
 parallel to Litterbox (litterbox.catbox.moe) - anonymous, no account
 needed, returns a real direct download link (not a landing page).
 
+Faster download: if the source server supports HTTP Range requests
+(most file hosts / CDNs do), the file is downloaded using several
+parallel connections instead of one - this is usually the biggest
+speed win, since a single connection is often capped well below your
+real bandwidth. Falls back to a normal single-stream download if the
+server doesn't support ranges.
+
 All uploaded parts expire after 1 hour (Litterbox's shortest retention
 option), so make sure to download them before the link expires.
 
-Fast settings: full 200MB chunks (no reduction in uploaded part size),
-4 parallel workers, and a shorter 1s delay between requests - so the
-download+upload pipeline moves as fast as the service allows.
-
 Usage:
-    python3 multi_upload.py <file_url> [chunk_size_mb] [max_workers] [seconds_between_requests]
+    python3 multi_upload.py <file_url> [chunk_size_mb] [upload_workers] [seconds_between_requests] [download_connections]
 
 Example (fast, default):
     python3 multi_upload.py "https://example.com/file.zip"
 
-Example (even more parallel workers):
-    python3 multi_upload.py "https://example.com/file.zip" 200 6 0.5
+Example (more download connections, more upload workers):
+    python3 multi_upload.py "https://example.com/file.zip" 200 4 1 8
 """
 import sys
 import os
@@ -39,12 +42,17 @@ session.headers.update({
 })
 
 # ---------------------------------------------------------------------------
-# Request rate limiting - avoids tripping the service's abuse protection
-# instead of trying to bypass it.
+# Request rate limiting for uploads - avoids tripping the service's abuse
+# protection instead of trying to bypass it.
 # ---------------------------------------------------------------------------
 MIN_SECONDS_BETWEEN_REQUESTS = 1.0
 _rate_lock = threading.Lock()
 _last_request_time = [0.0]
+
+_progress_lock = threading.Lock()
+_total_downloaded = [0]
+_last_progress_print = [0]
+PROGRESS_EVERY_BYTES = 10 * 1024 * 1024  # print every 10MB downloaded
 
 
 def throttle():
@@ -56,6 +64,14 @@ def throttle():
         if wait > 0:
             time.sleep(wait)
         _last_request_time[0] = time.time()
+
+
+def report_download_progress(nbytes):
+    with _progress_lock:
+        _total_downloaded[0] += nbytes
+        if _total_downloaded[0] - _last_progress_print[0] >= PROGRESS_EVERY_BYTES:
+            print(f"[download] {_total_downloaded[0] / (1024*1024):.1f} MB downloaded so far...", flush=True)
+            _last_progress_print[0] = _total_downloaded[0]
 
 
 def upload_litterbox(filepath):
@@ -76,7 +92,7 @@ def is_rate_limited(error_text):
 
 
 def upload_worker(part_num, filepath, max_retries=5):
-    print(f"[background] Starting upload of part {part_num} to Litterbox ({LITTERBOX_TIME})...", flush=True)
+    print(f"[upload] Starting upload of part {part_num} to Litterbox ({LITTERBOX_TIME})...", flush=True)
 
     backoff = 5.0  # seconds - doubles on each rate-limit hit
 
@@ -106,106 +122,175 @@ def upload_worker(part_num, filepath, max_retries=5):
     return part_num, None
 
 
-def main():
-    if len(sys.argv) < 2:
-        print(
-            "Usage: python3 multi_upload.py <file_url> "
-            "[chunk_size_mb] [max_workers] [seconds_between_requests]"
-        )
-        print(f"All links expire after {LITTERBOX_TIME} (Litterbox).")
-        print("Defaults: 200MB chunks, 4 parallel workers, 1s min delay (fast).")
-        sys.exit(1)
+def check_range_support(url):
+    """Returns (supports_ranges: bool, total_size: int or None)."""
+    try:
+        r = session.head(url, timeout=(10, 20), allow_redirects=True)
+        size = r.headers.get("Content-Length")
+        accepts_ranges = r.headers.get("Accept-Ranges", "").lower() == "bytes"
+        if not accepts_ranges and size:
+            # Some servers omit Accept-Ranges on HEAD but still honor Range.
+            # Do a small probe GET with a Range header to confirm.
+            probe = session.get(url, headers={"Range": "bytes=0-0"}, timeout=(10, 20), stream=True)
+            accepts_ranges = probe.status_code == 206
+            probe.close()
+        return accepts_ranges, (int(size) if size else None)
+    except Exception:
+        return False, None
 
-    url = sys.argv[1]
-    chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 200
-    max_workers = int(sys.argv[3]) if len(sys.argv) > 3 else 4
-    global MIN_SECONDS_BETWEEN_REQUESTS
-    MIN_SECONDS_BETWEEN_REQUESTS = float(sys.argv[4]) if len(sys.argv) > 4 else MIN_SECONDS_BETWEEN_REQUESTS
 
-    CHUNK_SIZE = chunk_size_mb * 1024 * 1024
-    os.makedirs(TEMP_DIR, exist_ok=True)
+def download_range(url, start, end, dest_path, part_num):
+    """Downloads bytes [start, end] (inclusive) into dest_path."""
+    headers = {"Range": f"bytes={start}-{end}"}
+    with session.get(url, headers=headers, stream=True, timeout=(15, 60)) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                report_download_progress(len(chunk))
+    print(f"[download] Part {part_num} complete ({(end - start + 1) / (1024*1024):.1f} MB)", flush=True)
+    return part_num, dest_path
 
+
+def run_parallel_download(url, total_size, chunk_size, download_workers, upload_workers):
+    """Downloads the file as parallel ranged parts and uploads each part as
+    soon as it finishes downloading."""
+    num_parts = (total_size + chunk_size - 1) // chunk_size
     print(
-        f"Starting - chunk size {chunk_size_mb}MB - service: litterbox (expires in {LITTERBOX_TIME}) - "
-        f"workers: {max_workers} - min delay between requests: {MIN_SECONDS_BETWEEN_REQUESTS}s",
+        f"[download] Server supports parallel ranged downloads - "
+        f"{num_parts} part(s), {download_workers} download connections",
         flush=True,
     )
 
-    futures = []
-    executor = ThreadPoolExecutor(max_workers=max_workers)
+    download_executor = ThreadPoolExecutor(max_workers=download_workers)
+    upload_executor = ThreadPoolExecutor(max_workers=upload_workers)
 
-    part_num = 1
-    current_size = 0
-    total_downloaded = 0
-    last_progress_print = 0
-    PROGRESS_EVERY_BYTES = 10 * 1024 * 1024  # print every 10MB downloaded
+    download_futures = []
+    for part_num in range(1, num_parts + 1):
+        start = (part_num - 1) * chunk_size
+        end = min(start + chunk_size - 1, total_size - 1)
+        dest_path = os.path.join(TEMP_DIR, f"part_{part_num:03d}.bin")
+        fut = download_executor.submit(download_range, url, start, end, dest_path, part_num)
+        download_futures.append(fut)
 
-    print("Connecting to source URL...", flush=True)
+    upload_futures = []
+    for fut in as_completed(download_futures):
+        part_num, dest_path = fut.result()
+        upload_futures.append(upload_executor.submit(upload_worker, part_num, dest_path))
 
-    try:
-        with session.get(url, stream=True, timeout=(15, 60)) as r:
-            r.raise_for_status()
-            total_size_header = r.headers.get("Content-Length")
-            if total_size_header:
-                print(f"Source size: {int(total_size_header) / (1024*1024):.1f} MB", flush=True)
-            print("Download started, streaming to disk...", flush=True)
-
-            part_filename = f"part_{part_num:03d}.bin"
-            part_path = os.path.join(TEMP_DIR, part_filename)
-            part_file = open(part_path, "wb")
-
-            try:
-                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                    if not chunk:
-                        continue
-                    part_file.write(chunk)
-                    current_size += len(chunk)
-                    total_downloaded += len(chunk)
-
-                    if total_downloaded - last_progress_print >= PROGRESS_EVERY_BYTES:
-                        print(f"[download] {total_downloaded / (1024*1024):.1f} MB downloaded so far...", flush=True)
-                        last_progress_print = total_downloaded
-
-                    if current_size >= CHUNK_SIZE:
-                        part_file.close()
-                        print(f"[download] Part {part_num} complete ({current_size / (1024*1024):.1f} MB), queuing upload...", flush=True)
-                        future = executor.submit(upload_worker, part_num, part_path)
-                        futures.append(future)
-
-                        part_num += 1
-                        current_size = 0
-                        part_filename = f"part_{part_num:03d}.bin"
-                        part_path = os.path.join(TEMP_DIR, part_filename)
-                        part_file = open(part_path, "wb")
-
-                part_file.close()
-
-                if current_size > 0:
-                    print(f"[download] Final part {part_num} complete ({current_size / (1024*1024):.1f} MB), queuing upload...", flush=True)
-                    future = executor.submit(upload_worker, part_num, part_path)
-                    futures.append(future)
-                else:
-                    if os.path.exists(part_path):
-                        os.remove(part_path)
-
-            finally:
-                if not part_file.closed:
-                    part_file.close()
-
-    except Exception as e:
-        print(f"[error] Failed downloading the source file: {e}", flush=True)
-        executor.shutdown(wait=False)
-        sys.exit(1)
+    download_executor.shutdown(wait=True)
 
     results = []
-    for future in as_completed(futures):
-        res = future.result()
+    for fut in as_completed(upload_futures):
+        res = fut.result()
         if res and res[1]:
             results.append(res)
         else:
             print("[error] One of the background uploads failed!", flush=True)
 
-    executor.shutdown(wait=True)
+    upload_executor.shutdown(wait=True)
+    return results
+
+
+def run_sequential_download(url, chunk_size, upload_workers):
+    """Fallback: single-stream download, splitting into parts as it goes
+    and uploading each part in the background as soon as it's ready."""
+    print("[download] Server does not support ranged downloads - using a single stream", flush=True)
+
+    upload_executor = ThreadPoolExecutor(max_workers=upload_workers)
+    upload_futures = []
+
+    part_num = 1
+    current_size = 0
+
+    with session.get(url, stream=True, timeout=(15, 60)) as r:
+        r.raise_for_status()
+        part_path = os.path.join(TEMP_DIR, f"part_{part_num:03d}.bin")
+        part_file = open(part_path, "wb")
+
+        try:
+            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                if not chunk:
+                    continue
+                part_file.write(chunk)
+                current_size += len(chunk)
+                report_download_progress(len(chunk))
+
+                if current_size >= chunk_size:
+                    part_file.close()
+                    print(f"[download] Part {part_num} complete ({current_size / (1024*1024):.1f} MB), queuing upload...", flush=True)
+                    upload_futures.append(upload_executor.submit(upload_worker, part_num, part_path))
+
+                    part_num += 1
+                    current_size = 0
+                    part_path = os.path.join(TEMP_DIR, f"part_{part_num:03d}.bin")
+                    part_file = open(part_path, "wb")
+
+            part_file.close()
+            if current_size > 0:
+                print(f"[download] Final part {part_num} complete ({current_size / (1024*1024):.1f} MB), queuing upload...", flush=True)
+                upload_futures.append(upload_executor.submit(upload_worker, part_num, part_path))
+            elif os.path.exists(part_path):
+                os.remove(part_path)
+        finally:
+            if not part_file.closed:
+                part_file.close()
+
+    results = []
+    for fut in as_completed(upload_futures):
+        res = fut.result()
+        if res and res[1]:
+            results.append(res)
+        else:
+            print("[error] One of the background uploads failed!", flush=True)
+
+    upload_executor.shutdown(wait=True)
+    return results
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(
+            "Usage: python3 multi_upload.py <file_url> "
+            "[chunk_size_mb] [upload_workers] [seconds_between_requests] [download_connections]"
+        )
+        print(f"All links expire after {LITTERBOX_TIME} (Litterbox).")
+        print("Defaults: 200MB chunks, 4 upload workers, 1s min delay, 4 download connections.")
+        sys.exit(1)
+
+    url = sys.argv[1]
+    chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 200
+    upload_workers = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+    download_workers = int(sys.argv[5]) if len(sys.argv) > 5 else 4
+    global MIN_SECONDS_BETWEEN_REQUESTS
+    MIN_SECONDS_BETWEEN_REQUESTS = float(sys.argv[4]) if len(sys.argv) > 4 else MIN_SECONDS_BETWEEN_REQUESTS
+
+    chunk_size = chunk_size_mb * 1024 * 1024
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
+    print(
+        f"Starting - chunk size {chunk_size_mb}MB - service: litterbox (expires in {LITTERBOX_TIME}) - "
+        f"upload workers: {upload_workers} - download connections: {download_workers} - "
+        f"min delay between upload requests: {MIN_SECONDS_BETWEEN_REQUESTS}s",
+        flush=True,
+    )
+
+    print("Checking source server capabilities...", flush=True)
+    supports_ranges, total_size = check_range_support(url)
+    if total_size:
+        print(f"Source size: {total_size / (1024*1024):.1f} MB", flush=True)
+
+    try:
+        if supports_ranges and total_size:
+            results = run_parallel_download(url, total_size, chunk_size, download_workers, upload_workers)
+        else:
+            results = run_sequential_download(url, chunk_size, upload_workers)
+    except Exception as e:
+        print(f"[error] Failed downloading the source file: {e}", flush=True)
+        sys.exit(1)
+
     results.sort(key=lambda x: x[0])
 
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
