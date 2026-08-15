@@ -136,10 +136,20 @@ def main():
 
     part_num = 1
     current_size = 0
+    total_downloaded = 0
+    last_progress_print = 0
+    PROGRESS_EVERY_BYTES = 10 * 1024 * 1024  # print every 10MB downloaded
+
+    print("Connecting to source URL...", flush=True)
 
     try:
-        with session.get(url, stream=True, timeout=60) as r:
+        with session.get(url, stream=True, timeout=(15, 60)) as r:
             r.raise_for_status()
+            total_size_header = r.headers.get("Content-Length")
+            if total_size_header:
+                print(f"Source size: {int(total_size_header) / (1024*1024):.1f} MB", flush=True)
+            print("Download started, streaming to disk...", flush=True)
+
             part_filename = f"part_{part_num:03d}.bin"
             part_path = os.path.join(TEMP_DIR, part_filename)
             part_file = open(part_path, "wb")
@@ -150,9 +160,15 @@ def main():
                         continue
                     part_file.write(chunk)
                     current_size += len(chunk)
+                    total_downloaded += len(chunk)
+
+                    if total_downloaded - last_progress_print >= PROGRESS_EVERY_BYTES:
+                        print(f"[download] {total_downloaded / (1024*1024):.1f} MB downloaded so far...", flush=True)
+                        last_progress_print = total_downloaded
 
                     if current_size >= CHUNK_SIZE:
                         part_file.close()
+                        print(f"[download] Part {part_num} complete ({current_size / (1024*1024):.1f} MB), queuing upload...", flush=True)
                         future = executor.submit(upload_worker, part_num, part_path)
                         futures.append(future)
 
@@ -165,6 +181,7 @@ def main():
                 part_file.close()
 
                 if current_size > 0:
+                    print(f"[download] Final part {part_num} complete ({current_size / (1024*1024):.1f} MB), queuing upload...", flush=True)
                     future = executor.submit(upload_worker, part_num, part_path)
                     futures.append(future)
                 else:
