@@ -202,7 +202,7 @@ def run_parallel_download(url, total_size, chunk_size, download_workers, upload_
     for part_num in range(1, num_parts + 1):
         start = (part_num - 1) * chunk_size
         end = min(start + chunk_size - 1, total_size - 1)
-        dest_path = os.path.join(TEMP_DIR, f"part_{part_num:03d}.bin")
+        dest_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}.zip")
         fut = download_executor.submit(download_range, url, start, end, dest_path, part_num)
         download_futures.append(fut)
 
@@ -236,7 +236,7 @@ def run_sequential_download(url, chunk_size, upload_workers):
 
     with session.get(url, stream=True, timeout=(15, 60)) as r:
         r.raise_for_status()
-        part_path = os.path.join(TEMP_DIR, f"part_{part_num:03d}.bin")
+        part_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}.zip")
         part_file = open(part_path, "wb")
 
         try:
@@ -254,7 +254,7 @@ def run_sequential_download(url, chunk_size, upload_workers):
 
                     part_num += 1
                     current_size = 0
-                    part_path = os.path.join(TEMP_DIR, f"part_{part_num:03d}.bin")
+                    part_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}.zip")
                     part_file = open(part_path, "wb")
 
             part_file.close()
