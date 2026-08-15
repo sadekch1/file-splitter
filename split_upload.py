@@ -7,11 +7,18 @@ needed, returns a real direct download link (not a landing page).
 All uploaded parts expire after 1 hour (Litterbox's shortest retention
 option), so make sure to download them before the link expires.
 
+Fast settings: full 200MB chunks (no reduction in uploaded part size),
+4 parallel workers, and a shorter 1s delay between requests - so the
+download+upload pipeline moves as fast as the service allows.
+
 Usage:
     python3 multi_upload.py <file_url> [chunk_size_mb] [max_workers] [seconds_between_requests]
 
-Example:
-    python3 multi_upload.py "https://example.com/file.zip" 200
+Example (fast, default):
+    python3 multi_upload.py "https://example.com/file.zip"
+
+Example (even more parallel workers):
+    python3 multi_upload.py "https://example.com/file.zip" 200 6 0.5
 """
 import sys
 import os
@@ -35,7 +42,7 @@ session.headers.update({
 # Request rate limiting - avoids tripping the service's abuse protection
 # instead of trying to bypass it.
 # ---------------------------------------------------------------------------
-MIN_SECONDS_BETWEEN_REQUESTS = 3.0
+MIN_SECONDS_BETWEEN_REQUESTS = 1.0
 _rate_lock = threading.Lock()
 _last_request_time = [0.0]
 
@@ -106,11 +113,12 @@ def main():
             "[chunk_size_mb] [max_workers] [seconds_between_requests]"
         )
         print(f"All links expire after {LITTERBOX_TIME} (Litterbox).")
+        print("Defaults: 200MB chunks, 4 parallel workers, 1s min delay (fast).")
         sys.exit(1)
 
     url = sys.argv[1]
     chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 200
-    max_workers = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+    max_workers = int(sys.argv[3]) if len(sys.argv) > 3 else 4
     global MIN_SECONDS_BETWEEN_REQUESTS
     MIN_SECONDS_BETWEEN_REQUESTS = float(sys.argv[4]) if len(sys.argv) > 4 else MIN_SECONDS_BETWEEN_REQUESTS
 
