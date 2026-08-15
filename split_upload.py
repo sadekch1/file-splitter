@@ -77,13 +77,57 @@ def report_download_progress(nbytes):
 def upload_litterbox(filepath):
     """Uploads a file to Litterbox with a fixed 1-hour expiry.
     Returns (success: bool, direct_link_or_error: str)."""
+    start = time.time()
     with open(filepath, "rb") as f:
         files = {"fileToUpload": f}
         data = {"reqtype": "fileupload", "time": LITTERBOX_TIME}
-        r = session.post(LITTERBOX_URL, data=data, files=files, timeout=900)
+        # (connect_timeout, read_timeout) - fails fast instead of hanging
+        # silently for minutes if the host is slow/unreachable from this IP.
+        r = session.post(LITTERBOX_URL, data=data, files=files, timeout=(15, 180))
+    elapsed = time.time() - start
     if r.status_code == 200 and r.text.strip().startswith("http"):
+        print(f"[timing] Upload took {elapsed:.0f}s", flush=True)
         return True, r.text.strip()
-    return False, f"HTTP {r.status_code}: {r.text[:200]}"
+    return False, f"HTTP {r.status_code} after {elapsed:.0f}s: {r.text[:200]}"
+
+
+def upload_catbox(filepath):
+    """Fallback: permanent upload to catbox.moe (no expiry)."""
+    start = time.time()
+    with open(filepath, "rb") as f:
+        files = {"fileToUpload": f}
+        data = {"reqtype": "fileupload"}
+        r = session.post("https://catbox.moe/user/api.php", data=data, files=files, timeout=(15, 180))
+    elapsed = time.time() - start
+    if r.status_code == 200 and r.text.strip().startswith("http"):
+        print(f"[timing] Upload took {elapsed:.0f}s", flush=True)
+        return True, r.text.strip()
+    return False, f"HTTP {r.status_code} after {elapsed:.0f}s: {r.text[:200]}"
+
+
+def upload_pixeldrain(filepath):
+    """Fallback: permanent upload to pixeldrain.com."""
+    start = time.time()
+    filename = os.path.basename(filepath)
+    with open(filepath, "rb") as f:
+        r = session.post(f"https://pixeldrain.com/api/file/{filename}", data=f, timeout=(15, 180))
+    elapsed = time.time() - start
+    if r.status_code in (200, 201):
+        data = r.json()
+        if data.get("success") and data.get("id"):
+            print(f"[timing] Upload took {elapsed:.0f}s", flush=True)
+            return True, f"https://pixeldrain.com/api/file/{data['id']}?download"
+    return False, f"HTTP {r.status_code} after {elapsed:.0f}s: {r.text[:200]}"
+
+
+# Tried in order: primary service first, then fallbacks if it keeps failing
+# for reasons that have nothing to do with rate limiting (e.g. a 500 from
+# the host's own server).
+UPLOAD_CHAIN = [
+    ("litterbox", upload_litterbox),
+    ("catbox", upload_catbox),
+    ("pixeldrain", upload_pixeldrain),
+]
 
 
 def is_rate_limited(error_text):
@@ -91,31 +135,35 @@ def is_rate_limited(error_text):
     return "429" in text or "rate" in text or "too many" in text
 
 
-def upload_worker(part_num, filepath, max_retries=5):
-    print(f"[upload] Starting upload of part {part_num} to Litterbox ({LITTERBOX_TIME})...", flush=True)
+def upload_worker(part_num, filepath, max_retries_per_service=3):
+    for service_name, upload_fn in UPLOAD_CHAIN:
+        print(f"[upload] Starting upload of part {part_num} to {service_name}...", flush=True)
+        backoff = 5.0  # seconds - doubles on each rate-limit hit
 
-    backoff = 5.0  # seconds - doubles on each rate-limit hit
+        for attempt in range(1, max_retries_per_service + 1):
+            throttle()
+            try:
+                ok, result = upload_fn(filepath)
+                if ok:
+                    print(f"[done] Part {part_num} ({service_name}): {result}", flush=True)
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                    return part_num, result
 
-    for attempt in range(1, max_retries + 1):
-        throttle()
-        try:
-            ok, result = upload_litterbox(filepath)
-            if ok:
-                print(f"[done] Part {part_num}: {result}", flush=True)
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-                return part_num, result
+                print(f"[warn] {service_name} attempt {attempt} for part {part_num} failed: {result}", flush=True)
+                if is_rate_limited(result):
+                    print(f"[wait] Rate limited on {service_name}, waiting {backoff:.0f}s before retrying...", flush=True)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                    continue
+            except requests.exceptions.Timeout:
+                print(f"[warn] Part {part_num} attempt {attempt} on {service_name}: connection timed out", flush=True)
+            except Exception as e:
+                print(f"[warn] Error uploading part {part_num} via {service_name} (attempt {attempt}): {e}", flush=True)
 
-            print(f"[warn] Attempt {attempt} for part {part_num} failed: {result}", flush=True)
-            if is_rate_limited(result):
-                print(f"[wait] Rate limited, waiting {backoff:.0f}s before retrying...", flush=True)
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 120)
-                continue
-        except Exception as e:
-            print(f"[warn] Error uploading part {part_num} (attempt {attempt}): {e}", flush=True)
+            time.sleep(2)
 
-        time.sleep(2)
+        print(f"[warn] Giving up on {service_name} for part {part_num}, trying next service...", flush=True)
 
     if os.path.exists(filepath):
         os.remove(filepath)
@@ -294,7 +342,7 @@ def main():
     results.sort(key=lambda x: x[0])
 
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
-        f.write(f"# Litterbox links - expire in {LITTERBOX_TIME}\n")
+        f.write("# Links (litterbox = expires in 1h, catbox/pixeldrain fallback = permanent)\n")
         for num, link in results:
             f.write(f"Part {num}: {link}\n")
 
