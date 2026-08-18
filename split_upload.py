@@ -5,11 +5,11 @@ each part as an asset on a GitHub Release in this same repo.
 
 Supports two download modes:
   1. Direct HTTP download  – for plain file URLs (with optional parallel ranges)
-  2. yt-dlp download       – automatically used for m3u8 streams and video
-                             platform URLs (YouTube, Vimeo, Twitch, Twitter/X,
-                             TikTok, Facebook, Instagram, Dailymotion, …)
-                             yt-dlp merges all HLS/DASH segments into a single
-                             mp4 before splitting begins.
+  2. yt-dlp download        – automatically used for m3u8 streams and video
+                              platform URLs (YouTube, Vimeo, Twitch, Twitter/X,
+                              TikTok, Facebook, Instagram, Dailymotion, …)
+                              yt-dlp merges all HLS/DASH segments into a single
+                              mp4 before splitting begins.
 
 Requires a GitHub token with `contents: write` permission on this repo.
 In a GitHub Actions workflow, the built-in ${{ secrets.GITHUB_TOKEN }}
@@ -19,22 +19,12 @@ Usage:
     python3 split_upload.py <file_url> [chunk_size_mb] [upload_workers] [download_connections]
 
 Required environment variables:
-    GITHUB_TOKEN        – a token with contents:write on the target repo
+    GITHUB_TOKEN         – a token with contents:write on the target repo
     GITHUB_REPOSITORY   – "owner/repo" (GitHub Actions sets this automatically)
 
 Optional environment variables:
     YTDLP_FORMAT        – yt-dlp -f format string (default: "bestvideo+bestaudio/best")
     YTDLP_OUTPUT_EXT    – merge output extension (default: "mp4")
-
-Example:
-    # Plain file
-    python3 split_upload.py "https://example.com/file.zip" 100 4 8
-
-    # m3u8 stream
-    python3 split_upload.py "https://cdn.example.com/live/index.m3u8" 500
-
-    # YouTube / any yt-dlp-supported URL
-    python3 split_upload.py "https://www.youtube.com/watch?v=XXXXXXXXXXX" 500
 """
 
 import sys
@@ -46,6 +36,7 @@ import threading
 import subprocess
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, parse_qs
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
@@ -59,17 +50,11 @@ GITHUB_API        = "https://api.github.com"
 
 YTDLP_FORMAT       = os.environ.get("YTDLP_FORMAT",       "bestvideo+bestaudio/best")
 YTDLP_OUTPUT_EXT   = os.environ.get("YTDLP_OUTPUT_EXT",   "mp4")
-# Store your exported YouTube cookies (Netscape format) as a GitHub secret,
-# then base64-encode them and set YTDLP_COOKIES_B64 in the workflow env.
-# The script will decode it to a temp file and pass --cookies to yt-dlp.
 YTDLP_COOKIES_B64  = os.environ.get("YTDLP_COOKIES_B64",  "")
-# Alternative: path to an already-existing cookies file on the runner.
 YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "")
-# Space-separated extra flags forwarded verbatim to yt-dlp (e.g. "--proxy socks5://…")
 YTDLP_EXTRA_ARGS   = os.environ.get("YTDLP_EXTRA_ARGS",   "")
-YTDLP_COOKIES_TMP  = "ytdlp_cookies.txt"   # temp path when decoded from B64
+YTDLP_COOKIES_TMP  = "ytdlp_cookies.txt"
 
-# Domains / patterns that trigger yt-dlp instead of a direct HTTP download
 YTDLP_DOMAINS = {
     "youtube.com", "youtu.be",
     "vimeo.com",
@@ -108,10 +93,10 @@ gh_session.headers.update({
 
 _upload_lock   = threading.Lock()
 _progress_lock = threading.Lock()
-_total_downloaded  = [0]
+_total_downloaded   = [0]
 _last_progress_print = [0]
 PROGRESS_EVERY_BYTES = 10 * 1024 * 1024   # print every 10 MB
-_release = {}                              # filled once by ensure_release()
+_release = {}                               # filled once by ensure_release()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -130,14 +115,10 @@ def report_download_progress(nbytes: int) -> None:
 def is_ytdlp_url(url: str) -> bool:
     """Return True if this URL should be handled by yt-dlp."""
     url_lower = url.lower()
-    # Explicit m3u8 / HLS streams
     if ".m3u8" in url_lower or "m3u8" in url_lower:
         return True
-    # Known video-platform domains
-    from urllib.parse import urlparse
     try:
         host = urlparse(url).hostname or ""
-        # strip leading "www." for comparison
         host = host.removeprefix("www.")
         for domain in YTDLP_DOMAINS:
             if host == domain or host.endswith("." + domain):
@@ -155,8 +136,6 @@ def check_ytdlp() -> None:
             [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "yt-dlp"],
             check=True,
         )
-        # After pip install the console script may not be on PATH yet;
-        # re-invoke through the module entry-point in download_with_ytdlp().
         print("[yt-dlp] Installation complete.", flush=True)
 
 
@@ -196,10 +175,7 @@ def ensure_release() -> dict:
 
 
 def upload_asset_bytes(filepath: str, asset_name: str):
-    """Upload *filepath* as *asset_name* on the shared release.
-
-    Returns (success: bool, browser_download_url or error_str).
-    """
+    """Upload *filepath* as *asset_name* on the shared release."""
     release = ensure_release()
     start   = time.time()
 
@@ -305,12 +281,12 @@ def _resolve_cookies_file() -> str:
 def _build_ytdlp_cmd(url: str, output_template: str, extractor_args: str = "") -> list:
     cmd = [
         sys.executable, "-m", "yt_dlp",
-        "--format",              YTDLP_FORMAT,
+        "--format",               YTDLP_FORMAT,
         "--merge-output-format", YTDLP_OUTPUT_EXT,
         "--output",              output_template,
         "--no-warnings",
         "--progress",
-        "--retries",             "10",
+        "--retries",              "10",
         "--fragment-retries",    "10",
     ]
     cookies_path = _resolve_cookies_file()
@@ -345,94 +321,170 @@ def _ytdlp_find_output() -> str:
     return max(files, key=os.path.getmtime)
 
 
-# ── cobalt.tools fallback ─────────────────────────────────────────────────────
-
-COBALT_API = "https://api.cobalt.tools"
+# ── YouTube URL helpers ───────────────────────────────────────────────────────
 
 def _is_youtube_url(url: str) -> bool:
-    from urllib.parse import urlparse
     host = urlparse(url).hostname or ""
-    host = host.removeprefix("www.")
-    return host in ("youtube.com", "youtu.be")
+    return host.removeprefix("www.") in ("youtube.com", "youtu.be")
+
+
+def _extract_youtube_id(url: str) -> str:
+    """Return the 11-char video ID or raise ValueError."""
+    p = urlparse(url)
+    host = (p.hostname or "").removeprefix("www.")
+    if host == "youtu.be":
+        return p.path.lstrip("/").split("?")[0]
+    if host == "youtube.com":
+        vid = parse_qs(p.query).get("v", [None])[0]
+        if vid:
+            return vid
+    raise ValueError(f"Cannot extract video ID from: {url}")
+
+
+def _stream_to_file(download_url: str, dest: str, label: str) -> str:
+    """Download *download_url* streaming to *dest*. Returns *dest*."""
+    with session.get(download_url, stream=True, timeout=(20, 600)) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    report_download_progress(len(chunk))
+    size_mb = os.path.getsize(dest) / (1024 * 1024)
+    print(f"[{label}] Download complete → {dest} ({size_mb:.1f} MB)", flush=True)
+    return dest
+
+
+# ── Invidious fallback ────────────────────────────────────────────────────────
+
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.fdn.fr",
+    "https://yt.artemislena.eu",
+    "https://iv.ggtyler.dev",
+    "https://invidious.privacyredirect.com",
+    "https://invidious.nerdvpn.de",
+]
+
+
+def download_via_invidious(url: str) -> str:
+    import re
+    video_id = _extract_youtube_id(url)
+    os.makedirs(YTDLP_DIR, exist_ok=True)
+
+    for instance in INVIDIOUS_INSTANCES:
+        api_url = f"{instance}/api/v1/videos/{video_id}?fields=title,formatStreams"
+        print(f"[invidious] Trying {instance} …", flush=True)
+        try:
+            r = session.get(api_url, timeout=15)
+            if r.status_code != 200:
+                print(f"[invidious] {instance} → HTTP {r.status_code}, skipping", flush=True)
+                continue
+            data = r.json()
+        except Exception as exc:
+            print(f"[invidious] {instance} error: {exc}", flush=True)
+            continue
+
+        format_streams = data.get("formatStreams") or []
+        streams = [s for s in format_streams if "mp4" in s.get("type", "")]
+        if not streams:
+            print(f"[invidious] {instance} returned no mp4 streams, skipping", flush=True)
+            continue
+
+        def _res(s):
+            m = re.search(r"(\d+)p", s.get("resolution", "0p"))
+            return int(m.group(1)) if m else 0
+
+        best = max(streams, key=_res)
+        res  = best.get("resolution", "?")
+        dl   = best.get("url")
+        if not dl:
+            continue
+
+        title    = re.sub(r'[^\w\s-]', '', data.get("title", video_id))[:80].strip()
+        dest     = os.path.join(YTDLP_DIR, f"{title or video_id}.mp4")
+        print(f"[invidious] Downloading {res} stream from {instance}…", flush=True)
+        try:
+            return _stream_to_file(dl, dest, "invidious")
+        except Exception as exc:
+            print(f"[invidious] Download from {instance} failed: {exc}", flush=True)
+            if os.path.exists(dest):
+                os.remove(dest)
+
+    raise RuntimeError(
+        "All Invidious instances failed. "
+        "The video may be age-restricted, private, or unavailable in the instance's region."
+    )
+
+
+# ── cobalt.tools fallback ─────────────────────────────────────────────────────
+
+COBALT_INSTANCES = [
+    "https://api.cobalt.tools",
+    "https://cobalt.nadeko.net",
+]
 
 
 def download_via_cobalt(url: str) -> str:
-    """Download a YouTube video via cobalt.tools API (no auth required).
-
-    Returns the path of the downloaded file.
-    Raises RuntimeError if cobalt cannot handle the URL or the download fails.
-    """
-    print("[cobalt] Trying cobalt.tools API…", flush=True)
+    """Download via a cobalt.tools API instance (supports YouTube and others)."""
     os.makedirs(YTDLP_DIR, exist_ok=True)
 
-    # 1. Ask cobalt for a download link
-    headers = {
-        "Accept":       "application/json",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "url":           url,
-        "videoQuality":  "1080",
-        "filenameStyle": "basic",
-        "downloadMode":  "auto",
-    }
-    try:
-        r = session.post(COBALT_API, json=payload, headers=headers, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as exc:
-        raise RuntimeError(f"cobalt.tools API request failed: {exc}") from exc
+    for api_base in COBALT_INSTANCES:
+        print(f"[cobalt] Trying {api_base} …", flush=True)
+        headers = {
+            "Accept":       "application/json",
+            "Content-Type": "application/json",
+            "User-Agent":   "Mozilla/5.0 (compatible; split_upload/1.0)",
+        }
+        payload = {"url": url, "downloadMode": "auto"}
+        try:
+            r = session.post(
+                f"{api_base}/",
+                json=payload,
+                headers=headers,
+                timeout=30,
+            )
+            if r.status_code == 400:
+                payload = {"url": url, "vQuality": "1080", "isAudioMuted": False}
+                r = session.post(f"{api_base}/api/json", json=payload, headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as exc:
+            print(f"[cobalt] {api_base} request failed: {exc}", flush=True)
+            continue
 
-    status = data.get("status", "")
-    if status == "error":
-        raise RuntimeError(f"cobalt.tools returned error: {data.get('text', data)}")
-    if status not in ("tunnel", "redirect", "stream"):
-        raise RuntimeError(f"cobalt.tools returned unexpected status '{status}': {data}")
+        status = data.get("status", "")
+        if status == "error":
+            print(f"[cobalt] {api_base} error: {data.get('text', data)}", flush=True)
+            continue
+        if status not in ("tunnel", "redirect", "stream", "success"):
+            print(f"[cobalt] {api_base} unexpected status '{status}'", flush=True)
+            continue
 
-    download_url = data.get("url") or data.get("tunnel")
-    filename     = data.get("filename", f"cobalt_video.{YTDLP_OUTPUT_EXT}")
-    if not download_url:
-        raise RuntimeError(f"cobalt.tools gave no download URL: {data}")
+        dl       = data.get("url") or data.get("tunnel")
+        filename = data.get("filename", f"cobalt_video.{YTDLP_OUTPUT_EXT}")
+        if not dl:
+            continue
 
-    print(f"[cobalt] Got download URL (status={status}), downloading '{filename}'…", flush=True)
+        dest = os.path.join(YTDLP_DIR, filename)
+        print(f"[cobalt] Downloading '{filename}' …", flush=True)
+        try:
+            return _stream_to_file(dl, dest, "cobalt")
+        except Exception as exc:
+            print(f"[cobalt] Download failed: {exc}", flush=True)
+            if os.path.exists(dest):
+                os.remove(dest)
 
-    # 2. Stream the file to disk
-    dest = os.path.join(YTDLP_DIR, filename)
-    with session.get(download_url, stream=True, timeout=(15, 600)) as r:
-        r.raise_for_status()
-        total = 0
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                total += len(chunk)
-                report_download_progress(len(chunk))
-
-    size_mb = os.path.getsize(dest) / (1024 * 1024)
-    print(f"[cobalt] Download complete → {dest} ({size_mb:.1f} MB)", flush=True)
-    return dest
+    raise RuntimeError("All cobalt.tools instances failed.")
 
 
 # ── main yt-dlp entry point ───────────────────────────────────────────────────
 
 def download_with_ytdlp(url: str) -> str:
-    """Download *url* and return the path of the output file.
-
-    Strategy (tried in order, stops at first success):
-      1. yt-dlp  tv_embedded client  – lowest bot-detection friction
-      2. yt-dlp  ios         client  – good alternative
-      3. yt-dlp  android     client
-      4. yt-dlp  mweb        client
-      5. yt-dlp  web         client  – needs cookies but tries anyway
-      6. cobalt.tools API            – no auth, works even when yt-dlp is blocked
-                                       (YouTube only)
-    """
     check_ytdlp()
     os.makedirs(YTDLP_DIR, exist_ok=True)
     output_template = os.path.join(YTDLP_DIR, "%(title).100s.%(ext)s")
 
-    # yt-dlp client attempts (label, extractor-args override)
     yt_attempts = [
         ("tv_embedded", "youtube:player_client=tv_embedded"),
         ("ios",         "youtube:player_client=ios"),
@@ -456,14 +508,15 @@ def download_with_ytdlp(url: str) -> str:
 
     if ytdlp_ok:
         output_file = _ytdlp_find_output()
+    elif _is_youtube_url(url):
+        print("[fallback] All yt-dlp clients failed. Trying Invidious…", flush=True)
+        try:
+            output_file = download_via_invidious(url)
+        except Exception as exc:
+            print(f"[fallback] Invidious failed: {exc}\nTrying cobalt.tools…", flush=True)
+            output_file = download_via_cobalt(url)
     else:
-        # ── fallback: cobalt.tools ────────────────────────────────────────────
         print("[fallback] All yt-dlp clients failed. Trying cobalt.tools…", flush=True)
-        if not _is_youtube_url(url):
-            raise RuntimeError(
-                "All yt-dlp clients failed and cobalt.tools only supports YouTube.\n"
-                "The URL could not be downloaded."
-            )
         output_file = download_via_cobalt(url)
 
     size_mb = os.path.getsize(output_file) / (1024 * 1024)
@@ -476,10 +529,9 @@ def download_with_ytdlp(url: str) -> str:
 
 
 def split_and_upload_local_file(filepath: str, chunk_size: int, upload_workers: int):
-    """Split an already-downloaded local file into chunks and upload each part."""
     file_size = os.path.getsize(filepath)
     num_parts = max(1, (file_size + chunk_size - 1) // chunk_size)
-    ext       = os.path.splitext(filepath)[1]   # preserve original extension
+    ext       = os.path.splitext(filepath)[1]
 
     print(
         f"[split] {os.path.basename(filepath)} is {file_size / (1024*1024):.1f} MB → "
@@ -520,7 +572,6 @@ def split_and_upload_local_file(filepath: str, chunk_size: int, upload_workers: 
 # ── direct HTTP download paths ────────────────────────────────────────────────
 
 def check_range_support(url: str):
-    """Return (supports_ranges: bool, total_size: int | None)."""
     try:
         r    = session.head(url, timeout=(10, 20), allow_redirects=True)
         size = r.headers.get("Content-Length")
@@ -670,9 +721,7 @@ def main():
         flush=True,
     )
 
-    # ── decide download strategy ──────────────────────────────────────────────
     if is_ytdlp_url(url):
-        # ── yt-dlp path (m3u8 / video platforms) ─────────────────────────────
         print(f"[mode] yt-dlp detected for URL: {url}", flush=True)
         try:
             local_file = download_with_ytdlp(url)
@@ -685,12 +734,10 @@ def main():
 
         results = split_and_upload_local_file(local_file, chunk_size, upload_workers)
 
-        # Clean up yt-dlp temp dir
         if os.path.exists(YTDLP_DIR):
             shutil.rmtree(YTDLP_DIR, ignore_errors=True)
 
     else:
-        # ── direct HTTP path ──────────────────────────────────────────────────
         print(f"[mode] direct HTTP download for URL: {url}", flush=True)
         print("Checking source server capabilities…", flush=True)
         supports_ranges, total_size = check_range_support(url)
@@ -708,8 +755,7 @@ def main():
             print(f"[error] Download failed: {exc}", flush=True)
             sys.exit(1)
 
-    # ── write & upload the links file ─────────────────────────────────────────
-    results.sort(key=lambda x: x[0])   # sort by part number
+    results.sort(key=lambda x: x[0])
 
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
         for num, link in results:
@@ -721,7 +767,6 @@ def main():
     else:
         print(f"[error] Could not upload {LINKS_FILE} (parts were still uploaded).", flush=True)
 
-    # Clean up
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
