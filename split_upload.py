@@ -57,8 +57,17 @@ GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")   # "owner/repo"
 GITHUB_API        = "https://api.github.com"
 
-YTDLP_FORMAT     = os.environ.get("YTDLP_FORMAT", "bestvideo+bestaudio/best")
-YTDLP_OUTPUT_EXT = os.environ.get("YTDLP_OUTPUT_EXT", "mp4")
+YTDLP_FORMAT       = os.environ.get("YTDLP_FORMAT",       "bestvideo+bestaudio/best")
+YTDLP_OUTPUT_EXT   = os.environ.get("YTDLP_OUTPUT_EXT",   "mp4")
+# Store your exported YouTube cookies (Netscape format) as a GitHub secret,
+# then base64-encode them and set YTDLP_COOKIES_B64 in the workflow env.
+# The script will decode it to a temp file and pass --cookies to yt-dlp.
+YTDLP_COOKIES_B64  = os.environ.get("YTDLP_COOKIES_B64",  "")
+# Alternative: path to an already-existing cookies file on the runner.
+YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "")
+# Space-separated extra flags forwarded verbatim to yt-dlp (e.g. "--proxy socks5://…")
+YTDLP_EXTRA_ARGS   = os.environ.get("YTDLP_EXTRA_ARGS",   "")
+YTDLP_COOKIES_TMP  = "ytdlp_cookies.txt"   # temp path when decoded from B64
 
 # Domains / patterns that trigger yt-dlp instead of a direct HTTP download
 YTDLP_DOMAINS = {
@@ -278,42 +287,191 @@ def upload_links_file(path: str, max_retries: int = 4):
 
 # ── yt-dlp download path ──────────────────────────────────────────────────────
 
-def download_with_ytdlp(url: str) -> str:
-    """Download *url* with yt-dlp and return the path of the merged output file."""
-    check_ytdlp()
-    os.makedirs(YTDLP_DIR, exist_ok=True)
+def _resolve_cookies_file() -> str:
+    """Return a path to a cookies file, or '' if none configured."""
+    if YTDLP_COOKIES_B64:
+        import base64
+        raw = base64.b64decode(YTDLP_COOKIES_B64)
+        with open(YTDLP_COOKIES_TMP, "wb") as f:
+            f.write(raw)
+        print(f"[yt-dlp] Decoded cookies → {YTDLP_COOKIES_TMP}", flush=True)
+        return YTDLP_COOKIES_TMP
+    if YTDLP_COOKIES_FILE and os.path.isfile(YTDLP_COOKIES_FILE):
+        print(f"[yt-dlp] Using cookie file: {YTDLP_COOKIES_FILE}", flush=True)
+        return YTDLP_COOKIES_FILE
+    return ""
 
-    output_template = os.path.join(YTDLP_DIR, "%(title).100s.%(ext)s")
-    # Use `python -m yt_dlp` so it works even when the `yt-dlp` console
-    # script isn't on PATH yet (e.g. right after a pip install in the same
-    # process), and also to guarantee we're using the same Python environment.
+
+def _build_ytdlp_cmd(url: str, output_template: str, extractor_args: str = "") -> list:
     cmd = [
         sys.executable, "-m", "yt_dlp",
-        "--format",               YTDLP_FORMAT,
-        "--merge-output-format",  YTDLP_OUTPUT_EXT,
-        "--output",               output_template,
+        "--format",              YTDLP_FORMAT,
+        "--merge-output-format", YTDLP_OUTPUT_EXT,
+        "--output",              output_template,
         "--no-warnings",
         "--progress",
-        url,
+        "--retries",             "10",
+        "--fragment-retries",    "10",
     ]
+    cookies_path = _resolve_cookies_file()
+    if cookies_path:
+        cmd += ["--cookies", cookies_path]
+    if extractor_args:
+        cmd += ["--extractor-args", extractor_args]
+    if YTDLP_EXTRA_ARGS:
+        cmd += YTDLP_EXTRA_ARGS.split()
+    cmd.append(url)
+    return cmd
 
-    print(f"[yt-dlp] Command: {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, check=True)
 
-    # Locate the produced file (newest file in the output dir)
+def _ytdlp_cleanup_parts() -> None:
+    for f in glob.glob(os.path.join(YTDLP_DIR, "*.part")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def _ytdlp_find_output() -> str:
+    """Return the newest non-.part file in YTDLP_DIR, or raise."""
     files = [
         f for f in glob.glob(os.path.join(YTDLP_DIR, "*"))
-        if os.path.isfile(f)
+        if os.path.isfile(f) and not f.endswith(".part")
     ]
     if not files:
         raise RuntimeError(
-            f"yt-dlp finished but no output file found in {YTDLP_DIR}. "
-            "Check the yt-dlp log above for errors."
+            f"yt-dlp finished but no output file found in {YTDLP_DIR}."
         )
+    return max(files, key=os.path.getmtime)
 
-    output_file = max(files, key=os.path.getmtime)
+
+# ── cobalt.tools fallback ─────────────────────────────────────────────────────
+
+COBALT_API = "https://api.cobalt.tools"
+
+def _is_youtube_url(url: str) -> bool:
+    from urllib.parse import urlparse
+    host = urlparse(url).hostname or ""
+    host = host.removeprefix("www.")
+    return host in ("youtube.com", "youtu.be")
+
+
+def download_via_cobalt(url: str) -> str:
+    """Download a YouTube video via cobalt.tools API (no auth required).
+
+    Returns the path of the downloaded file.
+    Raises RuntimeError if cobalt cannot handle the URL or the download fails.
+    """
+    print("[cobalt] Trying cobalt.tools API…", flush=True)
+    os.makedirs(YTDLP_DIR, exist_ok=True)
+
+    # 1. Ask cobalt for a download link
+    headers = {
+        "Accept":       "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "url":           url,
+        "videoQuality":  "1080",
+        "filenameStyle": "basic",
+        "downloadMode":  "auto",
+    }
+    try:
+        r = session.post(COBALT_API, json=payload, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        raise RuntimeError(f"cobalt.tools API request failed: {exc}") from exc
+
+    status = data.get("status", "")
+    if status == "error":
+        raise RuntimeError(f"cobalt.tools returned error: {data.get('text', data)}")
+    if status not in ("tunnel", "redirect", "stream"):
+        raise RuntimeError(f"cobalt.tools returned unexpected status '{status}': {data}")
+
+    download_url = data.get("url") or data.get("tunnel")
+    filename     = data.get("filename", f"cobalt_video.{YTDLP_OUTPUT_EXT}")
+    if not download_url:
+        raise RuntimeError(f"cobalt.tools gave no download URL: {data}")
+
+    print(f"[cobalt] Got download URL (status={status}), downloading '{filename}'…", flush=True)
+
+    # 2. Stream the file to disk
+    dest = os.path.join(YTDLP_DIR, filename)
+    with session.get(download_url, stream=True, timeout=(15, 600)) as r:
+        r.raise_for_status()
+        total = 0
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                total += len(chunk)
+                report_download_progress(len(chunk))
+
+    size_mb = os.path.getsize(dest) / (1024 * 1024)
+    print(f"[cobalt] Download complete → {dest} ({size_mb:.1f} MB)", flush=True)
+    return dest
+
+
+# ── main yt-dlp entry point ───────────────────────────────────────────────────
+
+def download_with_ytdlp(url: str) -> str:
+    """Download *url* and return the path of the output file.
+
+    Strategy (tried in order, stops at first success):
+      1. yt-dlp  tv_embedded client  – lowest bot-detection friction
+      2. yt-dlp  ios         client  – good alternative
+      3. yt-dlp  android     client
+      4. yt-dlp  mweb        client
+      5. yt-dlp  web         client  – needs cookies but tries anyway
+      6. cobalt.tools API            – no auth, works even when yt-dlp is blocked
+                                       (YouTube only)
+    """
+    check_ytdlp()
+    os.makedirs(YTDLP_DIR, exist_ok=True)
+    output_template = os.path.join(YTDLP_DIR, "%(title).100s.%(ext)s")
+
+    # yt-dlp client attempts (label, extractor-args override)
+    yt_attempts = [
+        ("tv_embedded", "youtube:player_client=tv_embedded"),
+        ("ios",         "youtube:player_client=ios"),
+        ("android",     "youtube:player_client=android"),
+        ("mweb",        "youtube:player_client=mweb"),
+        ("web",         "youtube:player_client=web"),
+        ("default",     ""),
+    ]
+
+    ytdlp_ok = False
+    for label, ext_args in yt_attempts:
+        cmd = _build_ytdlp_cmd(url, output_template, ext_args)
+        print(f"[yt-dlp] Trying client={label}…", flush=True)
+        try:
+            subprocess.run(cmd, check=True)
+            ytdlp_ok = True
+            break
+        except subprocess.CalledProcessError as exc:
+            print(f"[yt-dlp] client={label} failed (exit {exc.returncode})", flush=True)
+            _ytdlp_cleanup_parts()
+
+    if ytdlp_ok:
+        output_file = _ytdlp_find_output()
+    else:
+        # ── fallback: cobalt.tools ────────────────────────────────────────────
+        print("[fallback] All yt-dlp clients failed. Trying cobalt.tools…", flush=True)
+        if not _is_youtube_url(url):
+            raise RuntimeError(
+                "All yt-dlp clients failed and cobalt.tools only supports YouTube.\n"
+                "The URL could not be downloaded."
+            )
+        output_file = download_via_cobalt(url)
+
     size_mb = os.path.getsize(output_file) / (1024 * 1024)
-    print(f"[yt-dlp] Download complete → {output_file} ({size_mb:.1f} MB)", flush=True)
+    print(f"[done] Output file: {output_file} ({size_mb:.1f} MB)", flush=True)
+
+    if os.path.exists(YTDLP_COOKIES_TMP):
+        os.remove(YTDLP_COOKIES_TMP)
+
     return output_file
 
 
