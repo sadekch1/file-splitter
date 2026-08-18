@@ -2,6 +2,39 @@
 """
 Download a large file (or video/m3u8 stream), split it into parts, and upload
 each part as an asset on a GitHub Release in this same repo.
+
+Supports two download modes:
+  1. Direct HTTP download  – for plain file URLs (with optional parallel ranges)
+  2. yt-dlp download       – automatically used for m3u8 streams and video
+                             platform URLs (YouTube, Vimeo, Twitch, Twitter/X,
+                             TikTok, Facebook, Instagram, Dailymotion, …)
+                             yt-dlp merges all HLS/DASH segments into a single
+                             mp4 before splitting begins.
+
+Requires a GitHub token with `contents: write` permission on this repo.
+In a GitHub Actions workflow, the built-in ${{ secrets.GITHUB_TOKEN }}
+already has this by default – no extra secret needed.
+
+Usage:
+    python3 split_upload.py <file_url> [chunk_size_mb] [upload_workers] [download_connections]
+
+Required environment variables:
+    GITHUB_TOKEN        – a token with contents:write on the target repo
+    GITHUB_REPOSITORY   – "owner/repo" (GitHub Actions sets this automatically)
+
+Optional environment variables:
+    YTDLP_FORMAT        – yt-dlp -f format string (default: "bestvideo+bestaudio/best")
+    YTDLP_OUTPUT_EXT    – merge output extension (default: "mp4")
+
+Example:
+    # Plain file
+    python3 split_upload.py "https://example.com/file.zip" 100 4 8
+
+    # m3u8 stream
+    python3 split_upload.py "https://cdn.example.com/live/index.m3u8" 500
+
+    # YouTube / any yt-dlp-supported URL
+    python3 split_upload.py "https://www.youtube.com/watch?v=XXXXXXXXXXX" 500
 """
 
 import sys
@@ -13,7 +46,6 @@ import threading
 import subprocess
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, parse_qs
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
@@ -27,17 +59,31 @@ GITHUB_API        = "https://api.github.com"
 
 YTDLP_FORMAT       = os.environ.get("YTDLP_FORMAT",       "bestvideo+bestaudio/best")
 YTDLP_OUTPUT_EXT   = os.environ.get("YTDLP_OUTPUT_EXT",   "mp4")
+# Store your exported YouTube cookies (Netscape format) as a GitHub secret,
+# then base64-encode them and set YTDLP_COOKIES_B64 in the workflow env.
+# The script will decode it to a temp file and pass --cookies to yt-dlp.
 YTDLP_COOKIES_B64  = os.environ.get("YTDLP_COOKIES_B64",  "")
+# Alternative: path to an already-existing cookies file on the runner.
 YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "")
+# Space-separated extra flags forwarded verbatim to yt-dlp (e.g. "--proxy socks5://…")
 YTDLP_EXTRA_ARGS   = os.environ.get("YTDLP_EXTRA_ARGS",   "")
-YTDLP_COOKIES_TMP  = "ytdlp_cookies.txt"
+YTDLP_COOKIES_TMP  = "ytdlp_cookies.txt"   # temp path when decoded from B64
 
+# Domains / patterns that trigger yt-dlp instead of a direct HTTP download
 YTDLP_DOMAINS = {
     "youtube.com", "youtu.be",
-    "vimeo.com", "dailymotion.com", "twitch.tv",
-    "twitter.com", "x.com", "facebook.com", "fb.watch",
-    "instagram.com", "tiktok.com", "streamtape.com",
-    "doodstream.com", "dood.watch", "vidlox.me", "ok.ru", "rutube.ru"
+    "vimeo.com",
+    "dailymotion.com",
+    "twitch.tv",
+    "twitter.com", "x.com",
+    "facebook.com", "fb.watch",
+    "instagram.com",
+    "tiktok.com",
+    "streamtape.com",
+    "doodstream.com", "dood.watch",
+    "vidlox.me",
+    "ok.ru",
+    "rutube.ru",
 }
 
 # ── HTTP sessions ──────────────────────────────────────────────────────────────
@@ -62,10 +108,10 @@ gh_session.headers.update({
 
 _upload_lock   = threading.Lock()
 _progress_lock = threading.Lock()
-_total_downloaded   = [0]
+_total_downloaded  = [0]
 _last_progress_print = [0]
 PROGRESS_EVERY_BYTES = 10 * 1024 * 1024   # print every 10 MB
-_release = {}                               # filled once by ensure_release()
+_release = {}                              # filled once by ensure_release()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -82,11 +128,16 @@ def report_download_progress(nbytes: int) -> None:
 
 
 def is_ytdlp_url(url: str) -> bool:
+    """Return True if this URL should be handled by yt-dlp."""
     url_lower = url.lower()
+    # Explicit m3u8 / HLS streams
     if ".m3u8" in url_lower or "m3u8" in url_lower:
         return True
+    # Known video-platform domains
+    from urllib.parse import urlparse
     try:
         host = urlparse(url).hostname or ""
+        # strip leading "www." for comparison
         host = host.removeprefix("www.")
         for domain in YTDLP_DOMAINS:
             if host == domain or host.endswith("." + domain):
@@ -97,23 +148,30 @@ def is_ytdlp_url(url: str) -> bool:
 
 
 def check_ytdlp() -> None:
+    """Install yt-dlp automatically if it is not already on PATH."""
     if shutil.which("yt-dlp") is None:
         print("[yt-dlp] Not found on PATH – installing via pip…", flush=True)
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "yt-dlp"],
             check=True,
         )
+        # After pip install the console script may not be on PATH yet;
+        # re-invoke through the module entry-point in download_with_ytdlp().
         print("[yt-dlp] Installation complete.", flush=True)
 
 
 # ── GitHub Release helpers ────────────────────────────────────────────────────
 
 def ensure_release() -> dict:
+    """Creates a new GitHub Release once and caches its metadata."""
     if _release:
         return _release
 
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        raise RuntimeError("GITHUB_TOKEN and GITHUB_REPOSITORY environment variables are required.")
+        raise RuntimeError(
+            "GITHUB_TOKEN and GITHUB_REPOSITORY environment variables are required.\n"
+            "In GitHub Actions, pass:  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}"
+        )
 
     tag = f"split-upload-{int(time.time())}"
     payload = {
@@ -131,17 +189,21 @@ def ensure_release() -> dict:
     r.raise_for_status()
     data = r.json()
     _release["id"]         = data["id"]
-    _release["upload_url"] = data["upload_url"].split("{")[0]
+    _release["upload_url"] = data["upload_url"].split("{")[0]   # strip {?name,label}
     _release["html_url"]   = data["html_url"]
     print(f"[release] Created release {tag}: {_release['html_url']}", flush=True)
     return _release
 
 
 def upload_asset_bytes(filepath: str, asset_name: str):
+    """Upload *filepath* as *asset_name* on the shared release.
+
+    Returns (success: bool, browser_download_url or error_str).
+    """
     release = ensure_release()
     start   = time.time()
 
-    with _upload_lock:
+    with _upload_lock:   # one-at-a-time to avoid 422 name clashes
         with open(filepath, "rb") as f:
             r = gh_session.post(
                 release["upload_url"],
@@ -162,6 +224,7 @@ def upload_asset_bytes(filepath: str, asset_name: str):
 
 
 def upload_worker(part_num: int, filepath: str, max_retries: int = 4):
+    """Upload one part file; retry on transient failures."""
     print(f"[upload] Starting upload of part {part_num}…", flush=True)
     backoff  = 5.0
     filename = os.path.basename(filepath)
@@ -182,6 +245,8 @@ def upload_worker(part_num: int, filepath: str, max_retries: int = 4):
                 filepath = new_path
                 filename = os.path.basename(filepath)
                 continue
+        except requests.exceptions.Timeout:
+            print(f"[warn] Part {part_num} attempt {attempt}: timed out", flush=True)
         except Exception as exc:
             print(f"[warn] Part {part_num} attempt {attempt}: {exc}", flush=True)
 
@@ -194,6 +259,7 @@ def upload_worker(part_num: int, filepath: str, max_retries: int = 4):
 
 
 def upload_links_file(path: str, max_retries: int = 4):
+    """Upload direct_links.txt as a release asset."""
     print(f"[upload] Uploading {os.path.basename(path)}…", flush=True)
     backoff     = 5.0
     asset_name  = os.path.basename(path)
@@ -204,9 +270,12 @@ def upload_links_file(path: str, max_retries: int = 4):
             if ok:
                 print(f"[done] {asset_name}: {result}", flush=True)
                 return result
+            print(f"[warn] Attempt {attempt} for {asset_name}: {result}", flush=True)
             if "422" in result or "already_exists" in result.lower():
                 asset_name = f"direct_links_{attempt}.txt"
                 continue
+        except requests.exceptions.Timeout:
+            print(f"[warn] {asset_name} attempt {attempt}: timed out", flush=True)
         except Exception as exc:
             print(f"[warn] {asset_name} attempt {attempt}: {exc}", flush=True)
 
@@ -219,13 +288,16 @@ def upload_links_file(path: str, max_retries: int = 4):
 # ── yt-dlp download path ──────────────────────────────────────────────────────
 
 def _resolve_cookies_file() -> str:
+    """Return a path to a cookies file, or '' if none configured."""
     if YTDLP_COOKIES_B64:
         import base64
         raw = base64.b64decode(YTDLP_COOKIES_B64)
         with open(YTDLP_COOKIES_TMP, "wb") as f:
             f.write(raw)
+        print(f"[yt-dlp] Decoded cookies → {YTDLP_COOKIES_TMP}", flush=True)
         return YTDLP_COOKIES_TMP
     if YTDLP_COOKIES_FILE and os.path.isfile(YTDLP_COOKIES_FILE):
+        print(f"[yt-dlp] Using cookie file: {YTDLP_COOKIES_FILE}", flush=True)
         return YTDLP_COOKIES_FILE
     return ""
 
@@ -233,12 +305,12 @@ def _resolve_cookies_file() -> str:
 def _build_ytdlp_cmd(url: str, output_template: str, extractor_args: str = "") -> list:
     cmd = [
         sys.executable, "-m", "yt_dlp",
-        "--format",               YTDLP_FORMAT,
+        "--format",              YTDLP_FORMAT,
         "--merge-output-format", YTDLP_OUTPUT_EXT,
         "--output",              output_template,
         "--no-warnings",
         "--progress",
-        "--retries",              "10",
+        "--retries",             "10",
         "--fragment-retries",    "10",
     ]
     cookies_path = _resolve_cookies_file()
@@ -261,168 +333,113 @@ def _ytdlp_cleanup_parts() -> None:
 
 
 def _ytdlp_find_output() -> str:
+    """Return the newest non-.part file in YTDLP_DIR, or raise."""
     files = [
         f for f in glob.glob(os.path.join(YTDLP_DIR, "*"))
         if os.path.isfile(f) and not f.endswith(".part")
     ]
     if not files:
-        raise RuntimeError(f"yt-dlp finished but no output file found in {YTDLP_DIR}.")
+        raise RuntimeError(
+            f"yt-dlp finished but no output file found in {YTDLP_DIR}."
+        )
     return max(files, key=os.path.getmtime)
 
 
-# ── YouTube URL helpers ───────────────────────────────────────────────────────
+# ── cobalt.tools fallback ─────────────────────────────────────────────────────
+
+COBALT_API = "https://api.cobalt.tools"
 
 def _is_youtube_url(url: str) -> bool:
+    from urllib.parse import urlparse
     host = urlparse(url).hostname or ""
-    return host.removeprefix("www.") in ("youtube.com", "youtu.be")
-
-
-def _extract_youtube_id(url: str) -> str:
-    p = urlparse(url)
-    host = (p.hostname or "").removeprefix("www.")
-    if host == "youtu.be":
-        return p.path.lstrip("/").split("?")[0]
-    if host == "youtube.com":
-        vid = parse_qs(p.query).get("v", [None])[0]
-        if vid:
-            return vid
-    raise ValueError(f"Cannot extract video ID from: {url}")
-
-
-def _stream_to_file(download_url: str, dest: str, label: str) -> str:
-    with session.get(download_url, stream=True, timeout=(20, 600)) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    report_download_progress(len(chunk))
-    size_mb = os.path.getsize(dest) / (1024 * 1024)
-    print(f"[{label}] Download complete → {dest} ({size_mb:.1f} MB)", flush=True)
-    return dest
-
-
-# ── Invidious fallback (Updated Active Instances) ────────────────────────────
-
-INVIDIOUS_INSTANCES = [
-    "https://invidious.io.lol",
-    "https://inv.tux.pizza",
-    "https://invidious.no-name-given.de",
-    "https://invidious.projectsegfau.lt",
-    "https://invidious.perennialte.ch"
-]
-
-
-def download_via_invidious(url: str) -> str:
-    import re
-    video_id = _extract_youtube_id(url)
-    os.makedirs(YTDLP_DIR, exist_ok=True)
-
-    for instance in INVIDIOUS_INSTANCES:
-        api_url = f"{instance}/api/v1/videos/{video_id}?fields=title,formatStreams"
-        print(f"[invidious] Trying {instance} …", flush=True)
-        try:
-            r = session.get(api_url, timeout=12)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-        except Exception:
-            continue
-
-        format_streams = data.get("formatStreams") or []
-        streams = [s for s in format_streams if "mp4" in s.get("type", "")]
-        if not streams:
-            continue
-
-        def _res(s):
-            m = re.search(r"(\d+)p", s.get("resolution", "0p"))
-            return int(m.group(1)) if m else 0
-
-        best = max(streams, key=_res)
-        dl   = best.get("url")
-        if not dl:
-            continue
-
-        title = re.sub(r'[^\w\s-]', '', data.get("title", video_id))[:80].strip()
-        dest  = os.path.join(YTDLP_DIR, f"{title or video_id}.mp4")
-        try:
-            return _stream_to_file(dl, dest, "invidious")
-        except Exception:
-            if os.path.exists(dest):
-                os.remove(dest)
-
-    raise RuntimeError("All Invidious instances failed.")
-
-
-# ── Cobalt.tools fallback (Updated to Cobalt API v10) ─────────────────────────
-
-COBALT_INSTANCES = [
-    "https://api.cobalt.tools",
-    "https://cobalt.stream.pet",
-    "https://co.wuk.sh"
-]
+    host = host.removeprefix("www.")
+    return host in ("youtube.com", "youtu.be")
 
 
 def download_via_cobalt(url: str) -> str:
+    """Download a YouTube video via cobalt.tools API (no auth required).
+
+    Returns the path of the downloaded file.
+    Raises RuntimeError if cobalt cannot handle the URL or the download fails.
+    """
+    print("[cobalt] Trying cobalt.tools API…", flush=True)
     os.makedirs(YTDLP_DIR, exist_ok=True)
 
-    for api_base in COBALT_INSTANCES:
-        print(f"[cobalt] Trying {api_base} …", flush=True)
-        headers = {
-            "Accept":       "application/json",
-            "Content-Type": "application/json",
-            "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36",
-        }
-        payload = {
-            "url": url,
-            "videoQuality": "1080",
-            "downloadMode": "auto"
-        }
-        try:
-            r = session.post(f"{api_base}/", json=payload, headers=headers, timeout=20)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-        except Exception as exc:
-            print(f"[cobalt] {api_base} error: {exc}", flush=True)
-            continue
+    # 1. Ask cobalt for a download link
+    headers = {
+        "Accept":       "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "url":           url,
+        "videoQuality":  "1080",
+        "filenameStyle": "basic",
+        "downloadMode":  "auto",
+    }
+    try:
+        r = session.post(COBALT_API, json=payload, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        raise RuntimeError(f"cobalt.tools API request failed: {exc}") from exc
 
-        status = data.get("status")
-        dl = None
-        if status in ("tunnel", "redirect"):
-            dl = data.get("url")
-        elif status == "picker":
-            picker = data.get("picker", [])
-            if picker:
-                dl = picker[0].get("url")
+    status = data.get("status", "")
+    if status == "error":
+        raise RuntimeError(f"cobalt.tools returned error: {data.get('text', data)}")
+    if status not in ("tunnel", "redirect", "stream"):
+        raise RuntimeError(f"cobalt.tools returned unexpected status '{status}': {data}")
 
-        if not dl:
-            continue
+    download_url = data.get("url") or data.get("tunnel")
+    filename     = data.get("filename", f"cobalt_video.{YTDLP_OUTPUT_EXT}")
+    if not download_url:
+        raise RuntimeError(f"cobalt.tools gave no download URL: {data}")
 
-        dest = os.path.join(YTDLP_DIR, f"cobalt_video.{YTDLP_OUTPUT_EXT}")
-        print(f"[cobalt] Downloading stream from {api_base}…", flush=True)
-        try:
-            return _stream_to_file(dl, dest, "cobalt")
-        except Exception as exc:
-            if os.path.exists(dest):
-                os.remove(dest)
+    print(f"[cobalt] Got download URL (status={status}), downloading '{filename}'…", flush=True)
 
-    raise RuntimeError("All cobalt.tools instances failed.")
+    # 2. Stream the file to disk
+    dest = os.path.join(YTDLP_DIR, filename)
+    with session.get(download_url, stream=True, timeout=(15, 600)) as r:
+        r.raise_for_status()
+        total = 0
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                total += len(chunk)
+                report_download_progress(len(chunk))
+
+    size_mb = os.path.getsize(dest) / (1024 * 1024)
+    print(f"[cobalt] Download complete → {dest} ({size_mb:.1f} MB)", flush=True)
+    return dest
 
 
 # ── main yt-dlp entry point ───────────────────────────────────────────────────
 
 def download_with_ytdlp(url: str) -> str:
+    """Download *url* and return the path of the output file.
+
+    Strategy (tried in order, stops at first success):
+      1. yt-dlp  tv_embedded client  – lowest bot-detection friction
+      2. yt-dlp  ios         client  – good alternative
+      3. yt-dlp  android     client
+      4. yt-dlp  mweb        client
+      5. yt-dlp  web         client  – needs cookies but tries anyway
+      6. cobalt.tools API            – no auth, works even when yt-dlp is blocked
+                                       (YouTube only)
+    """
     check_ytdlp()
     os.makedirs(YTDLP_DIR, exist_ok=True)
     output_template = os.path.join(YTDLP_DIR, "%(title).100s.%(ext)s")
 
+    # yt-dlp client attempts (label, extractor-args override)
     yt_attempts = [
         ("tv_embedded", "youtube:player_client=tv_embedded"),
         ("ios",         "youtube:player_client=ios"),
         ("android",     "youtube:player_client=android"),
-        ("web_creator", "youtube:player_client=web_creator"),
         ("mweb",        "youtube:player_client=mweb"),
+        ("web",         "youtube:player_client=web"),
+        ("default",     ""),
     ]
 
     ytdlp_ok = False
@@ -433,18 +450,21 @@ def download_with_ytdlp(url: str) -> str:
             subprocess.run(cmd, check=True)
             ytdlp_ok = True
             break
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as exc:
+            print(f"[yt-dlp] client={label} failed (exit {exc.returncode})", flush=True)
             _ytdlp_cleanup_parts()
 
     if ytdlp_ok:
         output_file = _ytdlp_find_output()
     else:
-        print("[fallback] yt-dlp direct clients failed. Trying Cobalt API…", flush=True)
-        try:
-            output_file = download_via_cobalt(url)
-        except Exception as exc:
-            print(f"[fallback] Cobalt failed: {exc}\nTrying Invidious API…", flush=True)
-            output_file = download_via_invidious(url)
+        # ── fallback: cobalt.tools ────────────────────────────────────────────
+        print("[fallback] All yt-dlp clients failed. Trying cobalt.tools…", flush=True)
+        if not _is_youtube_url(url):
+            raise RuntimeError(
+                "All yt-dlp clients failed and cobalt.tools only supports YouTube.\n"
+                "The URL could not be downloaded."
+            )
+        output_file = download_via_cobalt(url)
 
     size_mb = os.path.getsize(output_file) / (1024 * 1024)
     print(f"[done] Output file: {output_file} ({size_mb:.1f} MB)", flush=True)
@@ -456,11 +476,16 @@ def download_with_ytdlp(url: str) -> str:
 
 
 def split_and_upload_local_file(filepath: str, chunk_size: int, upload_workers: int):
+    """Split an already-downloaded local file into chunks and upload each part."""
     file_size = os.path.getsize(filepath)
     num_parts = max(1, (file_size + chunk_size - 1) // chunk_size)
-    ext       = os.path.splitext(filepath)[1]
+    ext       = os.path.splitext(filepath)[1]   # preserve original extension
 
-    print(f"[split] {os.path.basename(filepath)} is {file_size / (1024*1024):.1f} MB → {num_parts} part(s)", flush=True)
+    print(
+        f"[split] {os.path.basename(filepath)} is {file_size / (1024*1024):.1f} MB → "
+        f"{num_parts} part(s) of up to {chunk_size // (1024*1024)} MB each",
+        flush=True,
+    )
 
     os.makedirs(TEMP_DIR, exist_ok=True)
     upload_executor = ThreadPoolExecutor(max_workers=upload_workers)
@@ -472,13 +497,21 @@ def split_and_upload_local_file(filepath: str, chunk_size: int, upload_workers: 
             part_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}{ext}")
             with open(part_path, "wb") as pf:
                 pf.write(data)
-            upload_futures.append(upload_executor.submit(upload_worker, part_num, part_path))
+            print(
+                f"[split] Part {part_num} written ({len(data) / (1024*1024):.1f} MB), queuing upload…",
+                flush=True,
+            )
+            upload_futures.append(
+                upload_executor.submit(upload_worker, part_num, part_path)
+            )
 
     results = []
     for fut in as_completed(upload_futures):
         res = fut.result()
         if res and res[1]:
             results.append(res)
+        else:
+            print("[error] One background upload failed!", flush=True)
 
     upload_executor.shutdown(wait=True)
     return results
@@ -487,6 +520,7 @@ def split_and_upload_local_file(filepath: str, chunk_size: int, upload_workers: 
 # ── direct HTTP download paths ────────────────────────────────────────────────
 
 def check_range_support(url: str):
+    """Return (supports_ranges: bool, total_size: int | None)."""
     try:
         r    = session.head(url, timeout=(10, 20), allow_redirects=True)
         size = r.headers.get("Content-Length")
@@ -506,14 +540,26 @@ def download_range(url: str, start: int, end: int, dest_path: str, part_num: int
         r.raise_for_status()
         with open(dest_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    report_download_progress(len(chunk))
+                if not chunk:
+                    continue
+                f.write(chunk)
+                report_download_progress(len(chunk))
+    print(
+        f"[download] Part {part_num} complete ({(end - start + 1) / (1024*1024):.1f} MB)",
+        flush=True,
+    )
     return part_num, dest_path
 
 
-def run_parallel_download(url: str, total_size: int, chunk_size: int, download_workers: int, upload_workers: int):
+def run_parallel_download(url: str, total_size: int, chunk_size: int,
+                          download_workers: int, upload_workers: int):
     num_parts = (total_size + chunk_size - 1) // chunk_size
+    print(
+        f"[download] Parallel ranged download – {num_parts} part(s), "
+        f"{download_workers} connections",
+        flush=True,
+    )
+
     dl_exec  = ThreadPoolExecutor(max_workers=download_workers)
     up_exec  = ThreadPoolExecutor(max_workers=upload_workers)
     dl_futs  = []
@@ -530,12 +576,22 @@ def run_parallel_download(url: str, total_size: int, chunk_size: int, download_w
         up_futs.append(up_exec.submit(upload_worker, part_num, dest_path))
 
     dl_exec.shutdown(wait=True)
-    results = [fut.result() for fut in as_completed(up_futs) if fut.result() and fut.result()[1]]
+
+    results = []
+    for fut in as_completed(up_futs):
+        res = fut.result()
+        if res and res[1]:
+            results.append(res)
+        else:
+            print("[error] One background upload failed!", flush=True)
+
     up_exec.shutdown(wait=True)
     return results
 
 
 def run_sequential_download(url: str, chunk_size: int, upload_workers: int):
+    print("[download] Single-stream download (server does not support ranges)", flush=True)
+
     up_exec   = ThreadPoolExecutor(max_workers=upload_workers)
     up_futs   = []
     part_num  = 1
@@ -556,6 +612,11 @@ def run_sequential_download(url: str, chunk_size: int, upload_workers: int):
 
                 if cur_size >= chunk_size:
                     part_file.close()
+                    print(
+                        f"[download] Part {part_num} complete ({cur_size / (1024*1024):.1f} MB), "
+                        f"queuing upload…",
+                        flush=True,
+                    )
                     up_futs.append(up_exec.submit(upload_worker, part_num, part_path))
                     part_num  += 1
                     cur_size   = 0
@@ -564,6 +625,11 @@ def run_sequential_download(url: str, chunk_size: int, upload_workers: int):
 
             part_file.close()
             if cur_size > 0:
+                print(
+                    f"[download] Final part {part_num} ({cur_size / (1024*1024):.1f} MB), "
+                    f"queuing upload…",
+                    flush=True,
+                )
                 up_futs.append(up_exec.submit(upload_worker, part_num, part_path))
             elif os.path.exists(part_path):
                 os.remove(part_path)
@@ -571,7 +637,14 @@ def run_sequential_download(url: str, chunk_size: int, upload_workers: int):
             if not part_file.closed:
                 part_file.close()
 
-    results = [fut.result() for fut in as_completed(up_futs) if fut.result() and fut.result()[1]]
+    results = []
+    for fut in as_completed(up_futs):
+        res = fut.result()
+        if res and res[1]:
+            results.append(res)
+        else:
+            print("[error] One background upload failed!", flush=True)
+
     up_exec.shutdown(wait=True)
     return results
 
@@ -591,33 +664,52 @@ def main():
     chunk_size = chunk_size_mb * 1024 * 1024
     os.makedirs(TEMP_DIR, exist_ok=True)
 
+    print(
+        f"[start] chunk={chunk_size_mb}MB  upload_workers={upload_workers}  "
+        f"download_connections={download_workers}",
+        flush=True,
+    )
+
+    # ── decide download strategy ──────────────────────────────────────────────
     if is_ytdlp_url(url):
+        # ── yt-dlp path (m3u8 / video platforms) ─────────────────────────────
         print(f"[mode] yt-dlp detected for URL: {url}", flush=True)
         try:
             local_file = download_with_ytdlp(url)
+        except subprocess.CalledProcessError as exc:
+            print(f"[error] yt-dlp exited with code {exc.returncode}", flush=True)
+            sys.exit(1)
         except Exception as exc:
-            print(f"[error] Download failed completely: {exc}", flush=True)
+            print(f"[error] yt-dlp download failed: {exc}", flush=True)
             sys.exit(1)
 
         results = split_and_upload_local_file(local_file, chunk_size, upload_workers)
 
+        # Clean up yt-dlp temp dir
         if os.path.exists(YTDLP_DIR):
             shutil.rmtree(YTDLP_DIR, ignore_errors=True)
 
     else:
+        # ── direct HTTP path ──────────────────────────────────────────────────
         print(f"[mode] direct HTTP download for URL: {url}", flush=True)
+        print("Checking source server capabilities…", flush=True)
         supports_ranges, total_size = check_range_support(url)
+        if total_size:
+            print(f"Source size: {total_size / (1024*1024):.1f} MB", flush=True)
 
         try:
             if supports_ranges and total_size:
-                results = run_parallel_download(url, total_size, chunk_size, download_workers, upload_workers)
+                results = run_parallel_download(
+                    url, total_size, chunk_size, download_workers, upload_workers
+                )
             else:
                 results = run_sequential_download(url, chunk_size, upload_workers)
         except Exception as exc:
             print(f"[error] Download failed: {exc}", flush=True)
             sys.exit(1)
 
-    results.sort(key=lambda x: x[0])
+    # ── write & upload the links file ─────────────────────────────────────────
+    results.sort(key=lambda x: x[0])   # sort by part number
 
     with open(LINKS_FILE, "w", encoding="utf-8") as f:
         for num, link in results:
@@ -626,11 +718,14 @@ def main():
     links_url = upload_links_file(LINKS_FILE)
     if links_url:
         print(f"[done] {LINKS_FILE}: {links_url}", flush=True)
+    else:
+        print(f"[error] Could not upload {LINKS_FILE} (parts were still uploaded).", flush=True)
 
+    # Clean up
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
-    print(f"[finished] All parts uploaded successfully.", flush=True)
+    print(f"[finished] All parts uploaded. Links saved to {LINKS_FILE}.", flush=True)
 
 
 if __name__ == "__main__":
