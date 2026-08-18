@@ -139,13 +139,16 @@ def is_ytdlp_url(url: str) -> bool:
 
 
 def check_ytdlp() -> None:
-    """Raise a helpful error if yt-dlp is not installed."""
+    """Install yt-dlp automatically if it is not already on PATH."""
     if shutil.which("yt-dlp") is None:
-        raise RuntimeError(
-            "yt-dlp is not installed or not on PATH.\n"
-            "Install it with:  pip install yt-dlp\n"
-            "or:               sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && sudo chmod +x /usr/local/bin/yt-dlp"
+        print("[yt-dlp] Not found on PATH – installing via pip…", flush=True)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "yt-dlp"],
+            check=True,
         )
+        # After pip install the console script may not be on PATH yet;
+        # re-invoke through the module entry-point in download_with_ytdlp().
+        print("[yt-dlp] Installation complete.", flush=True)
 
 
 # ── GitHub Release helpers ────────────────────────────────────────────────────
@@ -281,8 +284,11 @@ def download_with_ytdlp(url: str) -> str:
     os.makedirs(YTDLP_DIR, exist_ok=True)
 
     output_template = os.path.join(YTDLP_DIR, "%(title).100s.%(ext)s")
+    # Use `python -m yt_dlp` so it works even when the `yt-dlp` console
+    # script isn't on PATH yet (e.g. right after a pip install in the same
+    # process), and also to guarantee we're using the same Python environment.
     cmd = [
-        "yt-dlp",
+        sys.executable, "-m", "yt_dlp",
         "--format",               YTDLP_FORMAT,
         "--merge-output-format",  YTDLP_OUTPUT_EXT,
         "--output",               output_template,
