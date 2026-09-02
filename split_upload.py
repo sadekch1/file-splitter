@@ -10,30 +10,67 @@ Requires a GitHub token with `contents: write` permission on this repo.
 In a GitHub Actions workflow, the built-in ${{ secrets.GITHUB_TOKEN }}
 already has this by default - no extra secret needed.
 
-Faster download: if the source server supports HTTP Range requests
-(most file hosts / CDNs do), the file is downloaded using several
-parallel connections instead of one.
+Two source modes:
+
+  1) Direct HTTP URL (default). If the source server supports HTTP
+     Range requests (most file hosts / CDNs do), the file is
+     downloaded using several parallel connections instead of one.
+
+  2) yt-dlp mode (--ytdlp). The URL is treated as a video-hosting page
+     (YouTube, Twitter/X, etc). yt-dlp downloads the video, merging
+     the best video+audio streams into a single file locally (ffmpeg
+     required), and that resulting file is then split and uploaded
+     using the exact same chunking/upload logic as mode 1.
 
 Usage:
-    python3 split_upload.py <file_url> [chunk_size_mb] [upload_workers] [download_connections]
+    python3 split_upload.py <url> [options]
+
+Options:
+    --chunk-size-mb N        Size of each part in MB (default: 100)
+    --upload-workers N       Concurrent upload workers (default: 2)
+    --download-connections N Parallel HTTP download connections,
+                              direct-URL mode only (default: 8)
+    --ytdlp                  Treat <url> as a video page and use
+                              yt-dlp + ffmpeg to fetch it instead of a
+                              direct HTTP download
+    --format FORMAT          yt-dlp format selector, only used with
+                              --ytdlp (default: "bestvideo+bestaudio/best")
 
 Required environment variables:
     GITHUB_TOKEN        - a token with contents:write on the target repo
     GITHUB_REPOSITORY   - "owner/repo" (GitHub Actions sets this automatically)
 
-Example:
-    python3 split_upload.py "https://example.com/file.zip" 100 4 8
+Examples:
+    python3 split_upload.py "https://example.com/file.zip" --chunk-size-mb 100
+    python3 split_upload.py "https://youtube.com/watch?v=XXXX" --ytdlp --format "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+
+Notes for --ytdlp mode:
+    - Requires `yt-dlp` and `ffmpeg` to be installed and on PATH.
+      In a GitHub Actions workflow:
+        pip install -U yt-dlp
+        sudo apt-get update && sudo apt-get install -y ffmpeg
+    - The whole video is downloaded to local disk first, then split
+      into parts. Make sure the runner has enough free disk space for
+      the full merged file (roughly 2x its size, since the original
+      is kept until every part has been uploaded successfully).
 """
 import sys
 import os
+import re
+import json
 import time
+import glob
 import shutil
+import argparse
 import threading
+import subprocess
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TEMP_DIR = "upload_parts"
-LINKS_FILE = "direct_links.txt"
+YTDLP_DIR = "ytdlp_download"
+DEFAULT_LINKS_FILE = "direct_links.txt"
+DEFAULT_FORMAT = "bestvideo+bestaudio/best"
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")  # "owner/repo"
@@ -56,21 +93,60 @@ _upload_lock = threading.Lock()  # GitHub release asset uploads: do one at a tim
 _progress_lock = threading.Lock()
 _total_downloaded = [0]
 _last_progress_print = [0]
-PROGRESS_EVERY_BYTES = 10 * 1024 * 1024  # print every 10MB downloaded
+PROGRESS_EVERY_BYTES = 10 * 1024 * 1024  # print every 10MB processed
 
 _release = {}  # filled in once by ensure_release()
 
 
-def report_download_progress(nbytes):
+def report_progress(nbytes, label="downloaded"):
     with _progress_lock:
         _total_downloaded[0] += nbytes
         if _total_downloaded[0] - _last_progress_print[0] >= PROGRESS_EVERY_BYTES:
-            print(f"[download] {_total_downloaded[0] / (1024*1024):.1f} MB downloaded so far...", flush=True)
+            print(f"[{label}] {_total_downloaded[0] / (1024*1024):.1f} MB so far...", flush=True)
             _last_progress_print[0] = _total_downloaded[0]
 
 
-def ensure_release():
-    """Creates a new GitHub Release to attach parts to, and caches its info."""
+# ---------------------------------------------------------------------------
+# Sanitizing helpers (used for --ytdlp mode, where names come from video
+# metadata and cannot be trusted to be filesystem/tag/asset-name safe)
+# ---------------------------------------------------------------------------
+
+def sanitize_tag(text, max_len=50, fallback="video"):
+    """Make a string safe to use as a git tag name: ASCII, no spaces,
+    no git-ref-forbidden characters, no leading/trailing dots or dashes."""
+    if not text:
+        return fallback
+    # Transliterate obviously-unsafe characters to '-'
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", text.strip())
+    text = re.sub(r"-{2,}", "-", text).strip("-.")
+    if not text:
+        return fallback
+    return text[:max_len].strip("-.") or fallback
+
+
+def sanitize_filename(text, max_len=80, fallback="video"):
+    """Make a string safe to use as a local filename / GitHub release
+    asset name. Keeps unicode (e.g. Arabic titles) but strips characters
+    that are unsafe in filenames or asset names."""
+    if not text:
+        return fallback
+    text = text.strip()
+    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", text)
+    text = re.sub(r"\s+", "_", text)
+    text = text.strip("._")
+    if not text:
+        return fallback
+    return text[:max_len].strip("._") or fallback
+
+
+# ---------------------------------------------------------------------------
+# GitHub Release helpers
+# ---------------------------------------------------------------------------
+
+def ensure_release(tag=None, name=None, body=None):
+    """Creates a new GitHub Release to attach parts to, and caches its info.
+    Only actually creates it on the first call; subsequent calls return the
+    cached release regardless of the arguments passed."""
     if _release:
         return _release
 
@@ -80,11 +156,11 @@ def ensure_release():
             "In GitHub Actions, pass GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}."
         )
 
-    tag = f"split-upload-{int(time.time())}"
+    tag = tag or f"split-upload-{int(time.time())}"
     payload = {
         "tag_name": tag,
-        "name": f"Split upload {tag}",
-        "body": "Automatically generated by split_upload.py",
+        "name": name or f"Split upload {tag}",
+        "body": body or "Automatically generated by split_upload.py",
         "draft": False,
         "prerelease": True,
     }
@@ -96,6 +172,18 @@ def ensure_release():
     _release["html_url"] = data["html_url"]
     print(f"[release] Created release {tag}: {_release['html_url']}", flush=True)
     return _release
+
+
+def delete_release_if_created():
+    """Best-effort cleanup: deletes the release (and its tag) if one was
+    created this run but the overall job failed before finishing."""
+    if not _release.get("id"):
+        return
+    try:
+        gh_session.delete(f"{GITHUB_API}/repos/{GITHUB_REPOSITORY}/releases/{_release['id']}", timeout=30)
+        print("[cleanup] Deleted incomplete release after failure.", flush=True)
+    except Exception as e:
+        print(f"[cleanup] Could not delete incomplete release: {e}", flush=True)
 
 
 def upload_asset_bytes(filepath, asset_name):
@@ -132,7 +220,7 @@ def upload_github_release_asset(filepath, part_num):
 
 
 def upload_links_file(path, max_retries=4):
-    """Uploads the direct_links.txt file itself as a release asset, so the
+    """Uploads the links .txt file itself as a release asset, so the
     ordered list of part links is also downloadable straight from the
     release page. Returns the browser_download_url, or None on failure."""
     print(f"[upload] Uploading {os.path.basename(path)} to GitHub Release...", flush=True)
@@ -149,7 +237,8 @@ def upload_links_file(path, max_retries=4):
             print(f"[warn] Attempt {attempt} for {asset_name} failed: {result}", flush=True)
             if "422" in result or "already_exists" in result.lower():
                 # Name clash - suffix a counter and retry immediately
-                asset_name = f"direct_links_{attempt}.txt"
+                base, ext = os.path.splitext(os.path.basename(path))
+                asset_name = f"{base}_{attempt}{ext}"
                 continue
         except requests.exceptions.Timeout:
             print(f"[warn] {asset_name} attempt {attempt}: connection timed out", flush=True)
@@ -195,6 +284,10 @@ def upload_worker(part_num, filepath, max_retries=4):
     return part_num, None
 
 
+# ---------------------------------------------------------------------------
+# Mode 1: direct HTTP download (unchanged behaviour from the original script)
+# ---------------------------------------------------------------------------
+
 def check_range_support(url):
     """Returns (supports_ranges: bool, total_size: int or None)."""
     try:
@@ -219,7 +312,7 @@ def download_range(url, start, end, dest_path, part_num):
                 if not chunk:
                     continue
                 f.write(chunk)
-                report_download_progress(len(chunk))
+                report_progress(len(chunk))
     print(f"[download] Part {part_num} complete ({(end - start + 1) / (1024*1024):.1f} MB)", flush=True)
     return part_num, dest_path
 
@@ -282,7 +375,7 @@ def run_sequential_download(url, chunk_size, upload_workers):
                     continue
                 part_file.write(chunk)
                 current_size += len(chunk)
-                report_download_progress(len(chunk))
+                report_progress(len(chunk))
 
                 if current_size >= chunk_size:
                     part_file.close()
@@ -316,61 +409,225 @@ def run_sequential_download(url, chunk_size, upload_workers):
     return results
 
 
+# ---------------------------------------------------------------------------
+# Mode 2: yt-dlp download (new)
+# ---------------------------------------------------------------------------
+
+def check_tool_available(name):
+    return shutil.which(name) is not None
+
+
+def fetch_ytdlp_metadata(url):
+    """Runs yt-dlp --dump-json to get metadata (title, etc.) without
+    downloading anything yet. Returns a dict (possibly empty on failure)."""
+    try:
+        proc = subprocess.run(
+            ["yt-dlp", "--no-playlist", "--dump-json", "--skip-download", url],
+            capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode != 0:
+            print(f"[warn] yt-dlp metadata lookup failed: {proc.stderr[:300]}", flush=True)
+            return {}
+        # --dump-json prints one JSON object per line; take the first
+        first_line = proc.stdout.strip().splitlines()[0]
+        return json.loads(first_line)
+    except Exception as e:
+        print(f"[warn] Could not fetch yt-dlp metadata: {e}", flush=True)
+        return {}
+
+
+def download_via_ytdlp(url, format_selector, dest_dir):
+    """Runs yt-dlp to download+merge video/audio into dest_dir.
+    Returns the path to the resulting single file."""
+    os.makedirs(dest_dir, exist_ok=True)
+    outtmpl = os.path.join(dest_dir, "video.%(ext)s")
+
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "-f", format_selector,
+        "--merge-output-format", "mp4",
+        "--no-part",
+        "-o", outtmpl,
+        url,
+    ]
+    print(f"[ytdlp] Running: {' '.join(cmd)}", flush=True)
+
+    proc = subprocess.run(cmd, timeout=None)
+    if proc.returncode != 0:
+        raise RuntimeError(f"yt-dlp exited with code {proc.returncode}")
+
+    candidates = [p for p in glob.glob(os.path.join(dest_dir, "video.*")) if not p.endswith(".part")]
+    if not candidates:
+        raise RuntimeError("yt-dlp finished but no output file was found on disk")
+    # Prefer the largest file, in case leftover thumbnails/subtitles matched the glob
+    result_path = max(candidates, key=os.path.getsize)
+    print(f"[ytdlp] Downloaded and merged: {result_path} "
+          f"({os.path.getsize(result_path) / (1024*1024):.1f} MB)", flush=True)
+    return result_path
+
+
+def split_local_file(filepath, chunk_size, upload_workers):
+    """Splits an already-downloaded local file into parts and uploads
+    each one, reusing the same upload_worker/backoff logic as the HTTP
+    download modes. Returns the list of (part_num, link) results."""
+    total_size = os.path.getsize(filepath)
+    num_parts = (total_size + chunk_size - 1) // chunk_size
+    print(f"[split] Splitting local file into {num_parts} part(s) of up to "
+          f"{chunk_size / (1024*1024):.0f} MB each", flush=True)
+
+    upload_executor = ThreadPoolExecutor(max_workers=upload_workers)
+    upload_futures = []
+
+    with open(filepath, "rb") as src:
+        for part_num in range(1, num_parts + 1):
+            part_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}.zip")
+            remaining = chunk_size
+            with open(part_path, "wb") as out:
+                while remaining > 0:
+                    block = src.read(min(4 * 1024 * 1024, remaining))
+                    if not block:
+                        break
+                    out.write(block)
+                    remaining -= len(block)
+                    report_progress(len(block), label="split")
+            actual_size = os.path.getsize(part_path)
+            print(f"[split] Part {part_num} ready ({actual_size / (1024*1024):.1f} MB), queuing upload...", flush=True)
+            upload_futures.append(upload_executor.submit(upload_worker, part_num, part_path))
+
+    results = []
+    for fut in as_completed(upload_futures):
+        res = fut.result()
+        if res and res[1]:
+            results.append(res)
+        else:
+            print("[error] One of the background uploads failed!", flush=True)
+
+    upload_executor.shutdown(wait=True)
+    return results
+
+
+def run_ytdlp_flow(url, format_selector, chunk_size, upload_workers):
+    if not check_tool_available("yt-dlp"):
+        raise RuntimeError(
+            "yt-dlp is not installed or not on PATH. Install it first, e.g.:\n"
+            "  pip install -U yt-dlp"
+        )
+    if not check_tool_available("ffmpeg"):
+        raise RuntimeError(
+            "ffmpeg is not installed or not on PATH (required to merge video+audio). Install it first, e.g.:\n"
+            "  sudo apt-get update && sudo apt-get install -y ffmpeg"
+        )
+
+    print("[ytdlp] Fetching video metadata...", flush=True)
+    metadata = fetch_ytdlp_metadata(url)
+    title = metadata.get("title") or ""
+
+    tag = f"split-upload-{sanitize_tag(title, fallback=str(int(time.time())))}-{int(time.time())}"
+    release_name = title if title else f"Split upload {tag}"
+    release_body = f"Automatically generated by split_upload.py (source: {url})"
+    links_filename = f"direct_links_{sanitize_filename(title)}.txt" if title else DEFAULT_LINKS_FILE
+
+    ensure_release(tag=tag, name=release_name, body=release_body)
+
+    local_file = download_via_ytdlp(url, format_selector, YTDLP_DIR)
+    try:
+        results = split_local_file(local_file, chunk_size, upload_workers)
+    finally:
+        if os.path.exists(YTDLP_DIR):
+            shutil.rmtree(YTDLP_DIR, ignore_errors=True)
+
+    return results, links_filename
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Download a large file (via direct HTTP or yt-dlp), split it, "
+                    "and upload the parts as GitHub Release assets.",
+    )
+    parser.add_argument("url", help="Direct file URL, or a video page URL when using --ytdlp")
+    parser.add_argument("--chunk-size-mb", type=int, default=100, help="Size of each part in MB (default: 100)")
+    parser.add_argument("--upload-workers", type=int, default=2, help="Concurrent upload workers (default: 2)")
+    parser.add_argument("--download-connections", type=int, default=8,
+                         help="Parallel HTTP download connections, direct-URL mode only (default: 8)")
+    parser.add_argument("--ytdlp", action="store_true",
+                         help="Treat <url> as a video page and use yt-dlp + ffmpeg to fetch it")
+    parser.add_argument("--format", default=DEFAULT_FORMAT,
+                         help=f"yt-dlp format selector, only used with --ytdlp (default: {DEFAULT_FORMAT!r})")
+    return parser.parse_args()
+
+
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 split_upload.py <file_url> [chunk_size_mb] [upload_workers] [download_connections]")
-        print("Requires env vars GITHUB_TOKEN and GITHUB_REPOSITORY (owner/repo).")
-        sys.exit(1)
+    args = parse_args()
 
-    url = sys.argv[1]
-    chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 100
-    upload_workers = int(sys.argv[3]) if len(sys.argv) > 3 else 2  # GitHub release uploads are serialized anyway
-    download_workers = int(sys.argv[4]) if len(sys.argv) > 4 else 8
-
-    chunk_size = chunk_size_mb * 1024 * 1024
+    chunk_size = args.chunk_size_mb * 1024 * 1024
     os.makedirs(TEMP_DIR, exist_ok=True)
 
     print(
-        f"Starting - chunk size {chunk_size_mb}MB - service: GitHub Release assets - "
-        f"upload workers: {upload_workers} - download connections: {download_workers}",
+        f"Starting - mode: {'yt-dlp' if args.ytdlp else 'direct HTTP'} - "
+        f"chunk size {args.chunk_size_mb}MB - service: GitHub Release assets - "
+        f"upload workers: {args.upload_workers}"
+        + ("" if args.ytdlp else f" - download connections: {args.download_connections}"),
         flush=True,
     )
 
-    print("Checking source server capabilities...", flush=True)
-    supports_ranges, total_size = check_range_support(url)
-    if total_size:
-        print(f"Source size: {total_size / (1024*1024):.1f} MB", flush=True)
+    links_filename = DEFAULT_LINKS_FILE
 
     try:
-        if supports_ranges and total_size:
-            results = run_parallel_download(url, total_size, chunk_size, download_workers, upload_workers)
+        if args.ytdlp:
+            results, links_filename = run_ytdlp_flow(
+                args.url, args.format, chunk_size, args.upload_workers
+            )
         else:
-            results = run_sequential_download(url, chunk_size, upload_workers)
+            print("Checking source server capabilities...", flush=True)
+            supports_ranges, total_size = check_range_support(args.url)
+            if total_size:
+                print(f"Source size: {total_size / (1024*1024):.1f} MB", flush=True)
+
+            if supports_ranges and total_size:
+                results = run_parallel_download(
+                    args.url, total_size, chunk_size, args.download_connections, args.upload_workers
+                )
+            else:
+                results = run_sequential_download(args.url, chunk_size, args.upload_workers)
     except Exception as e:
-        print(f"[error] Failed downloading the source file: {e}", flush=True)
+        print(f"[error] Failed: {e}", flush=True)
+        delete_release_if_created()
+        sys.exit(1)
+
+    expected_parts = None  # only known upfront in the parallel-HTTP path; skip strict check otherwise
+    if not results:
+        print("[error] No parts were uploaded successfully.", flush=True)
+        delete_release_if_created()
         sys.exit(1)
 
     # Sort ascending by part number so the .txt (and the printed order) is
     # always Part 1, Part 2, Part 3, ... regardless of upload/finish order.
     results.sort(key=lambda x: x[0])
 
-    with open(LINKS_FILE, "w", encoding="utf-8") as f:
+    with open(links_filename, "w", encoding="utf-8") as f:
         for num, link in results:
             f.write(f"{link}\n")
 
     # Also upload the links file itself as a release asset, so anyone
     # visiting the release page can grab the ordered list directly
     # without needing the Actions log.
-    links_asset_url = upload_links_file(LINKS_FILE)
+    links_asset_url = upload_links_file(links_filename)
     if links_asset_url:
-        print(f"[done] {LINKS_FILE}: {links_asset_url}", flush=True)
+        print(f"[done] {links_filename}: {links_asset_url}", flush=True)
     else:
-        print(f"[error] Failed to upload {LINKS_FILE} to the release (parts were still uploaded).", flush=True)
+        print(f"[error] Failed to upload {links_filename} to the release (parts were still uploaded).", flush=True)
 
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
-    print(f"[finished] All parts uploaded. Links saved to {LINKS_FILE}.", flush=True)
+    if _release.get("html_url"):
+        print(f"[release] {_release['html_url']}", flush=True)
+    print(f"[finished] All parts uploaded. Links saved to {links_filename}.", flush=True)
 
 
 if __name__ == "__main__":
