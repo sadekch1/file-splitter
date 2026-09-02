@@ -35,6 +35,12 @@ Options:
                               direct HTTP download
     --format FORMAT          yt-dlp format selector, only used with
                               --ytdlp (default: "bestvideo+bestaudio/best")
+    --cookies PATH            Path to a Netscape-format cookies.txt file,
+                              only used with --ytdlp. Needed when the
+                              source site (e.g. YouTube) requires a
+                              logged-in session to allow the download
+                              (e.g. "Sign in to confirm you're not a
+                              bot" errors).
 
 Required environment variables:
     GITHUB_TOKEN        - a token with contents:write on the target repo
@@ -417,12 +423,16 @@ def check_tool_available(name):
     return shutil.which(name) is not None
 
 
-def fetch_ytdlp_metadata(url):
+def fetch_ytdlp_metadata(url, cookies_file=None):
     """Runs yt-dlp --dump-json to get metadata (title, etc.) without
     downloading anything yet. Returns a dict (possibly empty on failure)."""
     try:
+        cmd = ["yt-dlp", "--no-playlist", "--dump-json", "--skip-download"]
+        if cookies_file:
+            cmd += ["--cookies", cookies_file]
+        cmd.append(url)
         proc = subprocess.run(
-            ["yt-dlp", "--no-playlist", "--dump-json", "--skip-download", url],
+            cmd,
             capture_output=True, text=True, timeout=120,
         )
         if proc.returncode != 0:
@@ -436,26 +446,98 @@ def fetch_ytdlp_metadata(url):
         return {}
 
 
-def download_via_ytdlp(url, format_selector, dest_dir):
+def download_via_ytdlp(url, format_selector, dest_dir, cookies_file=None,
+                        live_from_start=False, stream_duration=None, format_sort=None):
     """Runs yt-dlp to download+merge video/audio into dest_dir.
-    Returns the path to the resulting single file."""
+    Returns the path to the resulting single file.
+
+    live_from_start: if True, passes --live-from-start so an ongoing
+        broadcast is recorded from its beginning (platform-dependent,
+        e.g. supported on YouTube).
+    stream_duration: if set (seconds), the recording is stopped after
+        this many seconds by sending a graceful interrupt (SIGINT) to
+        yt-dlp, which finalizes (merges) whatever was captured so far
+        instead of leaving a broken/unmerged file. Intended for
+        open-ended live streams that would otherwise never finish.
+    format_sort: if set, forwarded as yt-dlp's -S/--format-sort value
+        (e.g. "res,tbr"). Some sites (Dailymotion and others that only
+        expose combined video+audio HLS renditions with sparse format
+        metadata) don't get ranked correctly by yt-dlp's default
+        "bestvideo+bestaudio/best" logic, silently landing on a low
+        rendition. Explicitly sorting by resolution/bitrate fixes this.
+    """
     os.makedirs(dest_dir, exist_ok=True)
     outtmpl = os.path.join(dest_dir, "video.%(ext)s")
 
     cmd = [
         "yt-dlp",
         "--no-playlist",
+    ]
+    if format_sort:
+        cmd += ["-S", format_sort]
+    cmd += [
         "-f", format_selector,
         "--merge-output-format", "mp4",
         "--no-part",
         "-o", outtmpl,
-        url,
     ]
+    if live_from_start:
+        cmd.append("--live-from-start")
+    if cookies_file:
+        cmd += ["--cookies", cookies_file]
+    cmd.append(url)
     print(f"[ytdlp] Running: {' '.join(cmd)}", flush=True)
 
-    proc = subprocess.run(cmd, timeout=None)
-    if proc.returncode != 0:
-        raise RuntimeError(f"yt-dlp exited with code {proc.returncode}")
+    if stream_duration is None:
+        proc = subprocess.run(cmd, timeout=None)
+        returncode = proc.returncode
+    else:
+        import signal as _signal
+        print(f"[ytdlp] Live recording will be stopped gracefully after "
+              f"{stream_duration}s ({stream_duration/60:.1f} min)", flush=True)
+        proc = subprocess.Popen(cmd)
+        timer_fired = threading.Event()
+
+        def _stop_recording():
+            timer_fired.set()
+            print("[ytdlp] Time limit reached - sending stop signal so "
+                  "yt-dlp can finalize the recording...", flush=True)
+            try:
+                proc.send_signal(_signal.SIGINT)
+            except Exception as e:
+                print(f"[warn] Could not send SIGINT to yt-dlp: {e}", flush=True)
+
+        timer = threading.Timer(stream_duration, _stop_recording)
+        timer.start()
+        try:
+            grace_period = max(180, int(stream_duration * 0.1))
+            try:
+                returncode = proc.wait(timeout=None if not timer_fired.is_set() else grace_period)
+            except subprocess.TimeoutExpired:
+                pass
+            # If the timer fired and yt-dlp still hasn't exited after the
+            # grace period, escalate: terminate, then kill as last resort.
+            if timer_fired.is_set() and proc.poll() is None:
+                print("[warn] yt-dlp did not exit after SIGINT + grace period, "
+                      "sending SIGTERM...", flush=True)
+                proc.terminate()
+                try:
+                    returncode = proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    print("[warn] yt-dlp still running, sending SIGKILL...", flush=True)
+                    proc.kill()
+                    returncode = proc.wait(timeout=30)
+            else:
+                returncode = proc.poll()
+        finally:
+            timer.cancel()
+
+    # A graceful SIGINT stop is expected to produce a non-zero-but-fine
+    # exit in some yt-dlp versions; treat "we deliberately stopped it" as
+    # success as long as an output file actually exists.
+    stopped_deliberately = stream_duration is not None
+    if returncode != 0 and not stopped_deliberately:
+        raise RuntimeError(f"yt-dlp exited with code {returncode}")
 
     candidates = [p for p in glob.glob(os.path.join(dest_dir, "video.*")) if not p.endswith(".part")]
     if not candidates:
@@ -507,7 +589,8 @@ def split_local_file(filepath, chunk_size, upload_workers):
     return results
 
 
-def run_ytdlp_flow(url, format_selector, chunk_size, upload_workers):
+def run_ytdlp_flow(url, format_selector, chunk_size, upload_workers, cookies_file=None,
+                    live_from_start=False, stream_duration=None, format_sort=None):
     if not check_tool_available("yt-dlp"):
         raise RuntimeError(
             "yt-dlp is not installed or not on PATH. Install it first, e.g.:\n"
@@ -518,9 +601,11 @@ def run_ytdlp_flow(url, format_selector, chunk_size, upload_workers):
             "ffmpeg is not installed or not on PATH (required to merge video+audio). Install it first, e.g.:\n"
             "  sudo apt-get update && sudo apt-get install -y ffmpeg"
         )
+    if cookies_file and not os.path.isfile(cookies_file):
+        raise RuntimeError(f"--cookies file not found: {cookies_file}")
 
     print("[ytdlp] Fetching video metadata...", flush=True)
-    metadata = fetch_ytdlp_metadata(url)
+    metadata = fetch_ytdlp_metadata(url, cookies_file=cookies_file)
     title = metadata.get("title") or ""
 
     tag = f"split-upload-{sanitize_tag(title, fallback=str(int(time.time())))}-{int(time.time())}"
@@ -530,7 +615,11 @@ def run_ytdlp_flow(url, format_selector, chunk_size, upload_workers):
 
     ensure_release(tag=tag, name=release_name, body=release_body)
 
-    local_file = download_via_ytdlp(url, format_selector, YTDLP_DIR)
+    local_file = download_via_ytdlp(
+        url, format_selector, YTDLP_DIR, cookies_file=cookies_file,
+        live_from_start=live_from_start, stream_duration=stream_duration,
+        format_sort=format_sort,
+    )
     try:
         results = split_local_file(local_file, chunk_size, upload_workers)
     finally:
@@ -558,6 +647,19 @@ def parse_args():
                          help="Treat <url> as a video page and use yt-dlp + ffmpeg to fetch it")
     parser.add_argument("--format", default=DEFAULT_FORMAT,
                          help=f"yt-dlp format selector, only used with --ytdlp (default: {DEFAULT_FORMAT!r})")
+    parser.add_argument("--cookies", default=None,
+                         help="Path to a Netscape-format cookies.txt file, only used with --ytdlp")
+    parser.add_argument("--live-from-start", action="store_true",
+                         help="For an ongoing live stream, record from its start instead of "
+                              "joining live (only used with --ytdlp; platform-dependent support)")
+    parser.add_argument("--stream-duration-minutes", type=float, default=None,
+                         help="For an ongoing/open-ended live stream, stop recording gracefully "
+                              "after this many minutes (only used with --ytdlp). Omit for normal "
+                              "videos, or for live streams that are known to end on their own.")
+    parser.add_argument("--format-sort", default=None,
+                         help="Forwarded as yt-dlp's -S/--format-sort (e.g. 'res,tbr'). Fixes "
+                              "sites where the default format ranking silently picks a low-quality "
+                              "rendition (e.g. some Dailymotion HLS videos).")
     return parser.parse_args()
 
 
@@ -579,8 +681,13 @@ def main():
 
     try:
         if args.ytdlp:
+            stream_duration_seconds = (
+                args.stream_duration_minutes * 60 if args.stream_duration_minutes else None
+            )
             results, links_filename = run_ytdlp_flow(
-                args.url, args.format, chunk_size, args.upload_workers
+                args.url, args.format, chunk_size, args.upload_workers, cookies_file=args.cookies,
+                live_from_start=args.live_from_start, stream_duration=stream_duration_seconds,
+                format_sort=args.format_sort,
             )
         else:
             print("Checking source server capabilities...", flush=True)
