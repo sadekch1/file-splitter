@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'رابط التحميل المباشر أو رابط فيديو (يوتيوب وغيره)'
+        description: 'رابط التحميل المباشر أو رابط فيديو/بث (يوتيوب وغيره)'
         required: true
         type: string
       chunk_size_mb:
@@ -12,7 +12,7 @@ on:
         default: '200'
         type: string
       use_ytdlp:
-        description: 'استخدم yt-dlp (فعّله لروابط يوتيوب/تويتر وغيرها من منصات الفيديو)'
+        description: 'استخدم yt-dlp (فعّله لروابط يوتيوب/تويتر وغيرها من منصات الفيديو/البث)'
         required: false
         default: false
         type: boolean
@@ -20,6 +20,21 @@ on:
         description: 'صيغة جودة yt-dlp (تُستخدم فقط إذا فعّلت use_ytdlp أعلاه)'
         required: false
         default: 'bestvideo+bestaudio/best'
+        type: string
+      ytdlp_format_sort:
+        description: 'ترتيب الجودة الصريح ليوت-دي-ال-بي (اتركه res,tbr لضمان اختيار أعلى دقة دائماً - مفيد خصوصاً لمواقع مثل Dailymotion)'
+        required: false
+        default: 'res,tbr'
+        type: string
+      live_from_start:
+        description: 'بث مباشر: سجّل من بداية البث بدل الانضمام مباشرة (يدعمها يوتيوب مثلاً)'
+        required: false
+        default: false
+        type: boolean
+      stream_duration_minutes:
+        description: 'بث مباشر مفتوح النهاية: أوقف التسجيل تلقائياً بعد كم دقيقة (اتركه فارغاً لفيديو عادي أو بث له نهاية معروفة)'
+        required: false
+        default: ''
         type: string
 jobs:
   split-upload:
@@ -39,12 +54,30 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
+      - name: Install Deno (JS runtime needed by yt-dlp for full-quality YouTube formats)
+        if: ${{ inputs.use_ytdlp }}
+        run: |
+          curl -fsSL https://deno.land/install.sh | sh -s -- -y
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+
       - name: Install yt-dlp and ffmpeg (only if needed)
         if: ${{ inputs.use_ytdlp }}
         run: |
           pip install -U yt-dlp
           sudo apt-get update
           sudo apt-get install -y ffmpeg
+
+      - name: Write cookies file from secret (only if needed)
+        if: ${{ inputs.use_ytdlp }}
+        env:
+          YTDLP_COOKIES_B64: ${{ secrets.YTDLP_COOKIES_B64 }}
+        run: |
+          if [ -n "$YTDLP_COOKIES_B64" ]; then
+            echo "$YTDLP_COOKIES_B64" | base64 -d > cookies.txt
+            echo "Cookies file written."
+          else
+            echo "No YTDLP_COOKIES_B64 secret set - continuing without cookies."
+          fi
 
       - name: Run split & upload script (direct HTTP mode)
         if: ${{ !inputs.use_ytdlp }}
@@ -58,7 +91,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python split_upload.py "${{ inputs.url }}" --chunk-size-mb "${{ inputs.chunk_size_mb }}" --ytdlp --format "${{ inputs.ytdlp_format }}"
+        run: |
+          EXTRA_ARGS=""
+          if [ -f cookies.txt ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --cookies cookies.txt"
+          fi
+          if [ "${{ inputs.live_from_start }}" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --live-from-start"
+          fi
+          if [ -n "${{ inputs.stream_duration_minutes }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --stream-duration-minutes ${{ inputs.stream_duration_minutes }}"
+          fi
+          if [ -n "${{ inputs.ytdlp_format_sort }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --format-sort ${{ inputs.ytdlp_format_sort }}"
+          fi
+          python split_upload.py "${{ inputs.url }}" --chunk-size-mb "${{ inputs.chunk_size_mb }}" --ytdlp --format "${{ inputs.ytdlp_format }}" $EXTRA_ARGS
 
       - name: Upload links file as artifact
         if: always()
@@ -66,3 +113,7 @@ jobs:
         with:
           name: gofile-links
           path: direct_links*.txt
+
+      - name: Remove cookies file (security cleanup)
+        if: always()
+        run: rm -f cookies.txt
