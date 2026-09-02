@@ -3,13 +3,23 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'رابط التحميل المباشر'
+        description: 'رابط التحميل المباشر أو رابط فيديو (يوتيوب وغيره)'
         required: true
         type: string
       chunk_size_mb:
         description: 'حجم الجزء بالميغابايت'
         required: false
         default: '200'
+        type: string
+      use_ytdlp:
+        description: 'استخدم yt-dlp (فعّله لروابط يوتيوب/تويتر وغيرها من منصات الفيديو)'
+        required: false
+        default: false
+        type: boolean
+      ytdlp_format:
+        description: 'صيغة جودة yt-dlp (تُستخدم فقط إذا فعّلت use_ytdlp أعلاه)'
+        required: false
+        default: 'bestvideo+bestaudio/best'
         type: string
 jobs:
   split-upload:
@@ -20,17 +30,36 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: pip install requests
-      - name: Run split & upload script
+
+      - name: Install yt-dlp and ffmpeg (only if needed)
+        if: ${{ inputs.use_ytdlp }}
+        run: |
+          pip install -U yt-dlp
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Run split & upload script (direct HTTP mode)
+        if: ${{ !inputs.use_ytdlp }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python split_upload.py "${{ github.event.inputs.url }}" --chunk-size-mb "${{ github.event.inputs.chunk_size_mb }}"
+        run: python split_upload.py "${{ inputs.url }}" --chunk-size-mb "${{ inputs.chunk_size_mb }}"
+
+      - name: Run split & upload script (yt-dlp mode)
+        if: ${{ inputs.use_ytdlp }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python split_upload.py "${{ inputs.url }}" --chunk-size-mb "${{ inputs.chunk_size_mb }}" --ytdlp --format "${{ inputs.ytdlp_format }}"
+
       - name: Upload links file as artifact
         if: always()
         uses: actions/upload-artifact@v4
