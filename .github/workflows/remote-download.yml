@@ -1,0 +1,31 @@
+name: Remote Download & Split
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'رابط الملف المراد تحميله وتقسيمه'
+        required: true
+      chunk_size_mb:
+        description: 'حجم الجزء بالميجابايت'
+        required: false
+        default: '100'
+
+permissions:
+  contents: write
+
+jobs:
+  split-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - name: Run split & upload
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 split_upload.py "${{ github.event.inputs.file_url }}" "${{ github.event.inputs.chunk_size_mb }}"
