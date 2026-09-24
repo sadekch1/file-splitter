@@ -23,10 +23,10 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install requests
-      - name: Install aria2 (and confirm ffmpeg is present)
+      - name: Install aria2 and ffmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2
+          sudo apt-get install -y aria2 ffmpeg
           aria2c --version
           ffmpeg -version
       - name: Run split & upload
