@@ -14,30 +14,20 @@ Faster download: if the source server supports HTTP Range requests
 (most file hosts / CDNs do), the file is downloaded using several
 parallel connections instead of one.
 
-HLS / m3u8 support: if <file_url> is (or points to) an .m3u8 playlist,
-it is downloaded and remuxed into a single file with ffmpeg first
-(handling segment downloading and playlist-referenced decryption),
-then that local file is split and uploaded exactly like any other
-source. ffmpeg must be available on PATH - it's preinstalled on
-GitHub Actions' ubuntu-latest runners.
-
 Usage:
     python3 split_upload.py <file_url> [chunk_size_mb] [upload_workers] [download_connections]
 
 Required environment variables:
-    GITHUB_TOKEN      - a token with contents:write on the target repo
-    GITHUB_REPOSITORY - "owner/repo" (GitHub Actions sets this automatically)
+    GITHUB_TOKEN        - a token with contents:write on the target repo
+    GITHUB_REPOSITORY   - "owner/repo" (GitHub Actions sets this automatically)
 
 Example:
     python3 split_upload.py "https://example.com/file.zip" 100 4 8
-    python3 split_upload.py "https://example.com/stream/index.m3u8" 100 4 8
 """
-
 import sys
 import os
 import time
 import shutil
-import subprocess
 import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -62,6 +52,7 @@ gh_session.headers.update({
 })
 
 _upload_lock = threading.Lock()  # GitHub release asset uploads: do one at a time to avoid 422 name clashes
+
 _progress_lock = threading.Lock()
 _total_downloaded = [0]
 _last_progress_print = [0]
@@ -112,6 +103,7 @@ def upload_asset_bytes(filepath, asset_name):
     Returns (success: bool, direct_link_or_error: str)."""
     release = ensure_release()
     start = time.time()
+
     with _upload_lock:  # GitHub release asset upload endpoint doesn't like concurrent uploads well
         with open(filepath, "rb") as f:
             r = gh_session.post(
@@ -122,6 +114,7 @@ def upload_asset_bytes(filepath, asset_name):
                 timeout=(15, 600),
             )
     elapsed = time.time() - start
+
     if r.status_code in (200, 201):
         data = r.json()
         link = data.get("browser_download_url")
@@ -145,12 +138,14 @@ def upload_links_file(path, max_retries=4):
     print(f"[upload] Uploading {os.path.basename(path)} to GitHub Release...", flush=True)
     backoff = 5.0
     asset_name = os.path.basename(path)
+
     for attempt in range(1, max_retries + 1):
         try:
             ok, result = upload_asset_bytes(path, asset_name)
             if ok:
                 print(f"[done] {asset_name}: {result}", flush=True)
                 return result
+
             print(f"[warn] Attempt {attempt} for {asset_name} failed: {result}", flush=True)
             if "422" in result or "already_exists" in result.lower():
                 # Name clash - suffix a counter and retry immediately
@@ -160,14 +155,17 @@ def upload_links_file(path, max_retries=4):
             print(f"[warn] {asset_name} attempt {attempt}: connection timed out", flush=True)
         except Exception as e:
             print(f"[warn] Error uploading {asset_name} (attempt {attempt}): {e}", flush=True)
+
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)
+
     return None
 
 
 def upload_worker(part_num, filepath, max_retries=4):
     print(f"[upload] Starting upload of part {part_num} to GitHub Release...", flush=True)
     backoff = 5.0
+
     for attempt in range(1, max_retries + 1):
         try:
             ok, result = upload_github_release_asset(filepath, part_num)
@@ -176,6 +174,7 @@ def upload_worker(part_num, filepath, max_retries=4):
                 if os.path.exists(filepath):
                     os.remove(filepath)
                 return part_num, result
+
             print(f"[warn] Attempt {attempt} for part {part_num} failed: {result}", flush=True)
             if "422" in result or "already_exists" in result.lower():
                 # Rare name clash - regenerate a fresh unique filename and retry immediately
@@ -187,8 +186,10 @@ def upload_worker(part_num, filepath, max_retries=4):
             print(f"[warn] Part {part_num} attempt {attempt}: connection timed out", flush=True)
         except Exception as e:
             print(f"[warn] Error uploading part {part_num} (attempt {attempt}): {e}", flush=True)
+
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)
+
     if os.path.exists(filepath):
         os.remove(filepath)
     return part_num, None
@@ -274,6 +275,7 @@ def run_sequential_download(url, chunk_size, upload_workers):
         r.raise_for_status()
         part_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}.zip")
         part_file = open(part_path, "wb")
+
         try:
             for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
                 if not chunk:
@@ -286,6 +288,7 @@ def run_sequential_download(url, chunk_size, upload_workers):
                     part_file.close()
                     print(f"[download] Part {part_num} complete ({current_size / (1024*1024):.1f} MB), queuing upload...", flush=True)
                     upload_futures.append(upload_executor.submit(upload_worker, part_num, part_path))
+
                     part_num += 1
                     current_size = 0
                     part_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}.zip")
@@ -313,109 +316,9 @@ def run_sequential_download(url, chunk_size, upload_workers):
     return results
 
 
-# --------------------------------------------------------------------------
-# HLS / m3u8 support
-# --------------------------------------------------------------------------
-
-def is_m3u8_url(url):
-    """Detects an HLS playlist link: ends in .m3u8, or has it in the path/query
-    (common when the link was extracted from a video player's network requests)."""
-    path_only = url.split("?", 1)[0].split("#", 1)[0]
-    return path_only.lower().endswith(".m3u8") or ".m3u8" in url.lower()
-
-
-def download_hls_to_file(url, dest_path, referer=None):
-    """Downloads an HLS (.m3u8) stream to a single local file using ffmpeg.
-    Works for master or media playlists - ffmpeg handles segment downloading,
-    playlist-referenced AES-128 decryption, and remuxing into one file.
-    Requires ffmpeg on PATH (preinstalled on GitHub Actions ubuntu runners)."""
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError(
-            "ffmpeg is required to download m3u8/HLS links but was not found on PATH. "
-            "It's preinstalled on GitHub Actions ubuntu-latest runners; locally install it "
-            "(e.g. `apt-get install -y ffmpeg` or `brew install ffmpeg`)."
-        )
-
-    print(f"[hls] Detected an m3u8 link - downloading the stream with ffmpeg -> {dest_path}", flush=True)
-
-    headers = f"User-Agent: {session.headers['User-Agent']}\r\n"
-    if referer:
-        headers += f"Referer: {referer}\r\n"
-
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning", "-stats",
-        "-headers", headers,
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-        "-i", url,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        dest_path,
-    ]
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    last_print = 0.0
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        now = time.time()
-        if "time=" in line or "error" in line.lower():
-            if now - last_print >= 5:
-                print(f"[hls] {line}", flush=True)
-                last_print = now
-    proc.wait()
-
-    if proc.returncode != 0 or not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
-        raise RuntimeError(f"ffmpeg failed to download the HLS stream (exit code {proc.returncode}).")
-
-    size_mb = os.path.getsize(dest_path) / (1024 * 1024)
-    print(f"[hls] Done - downloaded and remuxed {size_mb:.1f} MB", flush=True)
-    return dest_path
-
-
-def split_local_file_and_upload(local_path, chunk_size, upload_workers, part_ext=".mp4"):
-    """Splits an already-downloaded local file into chunk_size parts and
-    uploads each one as it's cut, reusing the same upload_worker used for
-    the direct-download path."""
-    total_size = os.path.getsize(local_path)
-    num_parts = (total_size + chunk_size - 1) // chunk_size
-    print(
-        f"[split] Source is {total_size / (1024*1024):.1f} MB - splitting into "
-        f"{num_parts} part(s) of up to {chunk_size / (1024*1024):.0f}MB",
-        flush=True,
-    )
-
-    upload_executor = ThreadPoolExecutor(max_workers=upload_workers)
-    upload_futures = []
-
-    part_num = 1
-    with open(local_path, "rb") as src:
-        while True:
-            chunk = src.read(chunk_size)
-            if not chunk:
-                break
-            part_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}{part_ext}")
-            with open(part_path, "wb") as pf:
-                pf.write(chunk)
-            print(f"[split] Part {part_num} ready ({len(chunk) / (1024*1024):.1f} MB), queuing upload...", flush=True)
-            upload_futures.append(upload_executor.submit(upload_worker, part_num, part_path))
-            part_num += 1
-
-    results = []
-    for fut in as_completed(upload_futures):
-        res = fut.result()
-        if res and res[1]:
-            results.append(res)
-        else:
-            print("[error] One of the background uploads failed!", flush=True)
-
-    upload_executor.shutdown(wait=True)
-    return results
-
-
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 split_upload.py <file_url_or_m3u8_link> [chunk_size_mb] [upload_workers] [download_connections]")
+        print("Usage: python3 split_upload.py <file_url> [chunk_size_mb] [upload_workers] [download_connections]")
         print("Requires env vars GITHUB_TOKEN and GITHUB_REPOSITORY (owner/repo).")
         sys.exit(1)
 
@@ -433,23 +336,16 @@ def main():
         flush=True,
     )
 
-    try:
-        if is_m3u8_url(url):
-            local_path = os.path.join(TEMP_DIR, "hls_source.mp4")
-            download_hls_to_file(url, local_path)
-            results = split_local_file_and_upload(local_path, chunk_size, upload_workers)
-            if os.path.exists(local_path):
-                os.remove(local_path)
-        else:
-            print("Checking source server capabilities...", flush=True)
-            supports_ranges, total_size = check_range_support(url)
-            if total_size:
-                print(f"Source size: {total_size / (1024*1024):.1f} MB", flush=True)
+    print("Checking source server capabilities...", flush=True)
+    supports_ranges, total_size = check_range_support(url)
+    if total_size:
+        print(f"Source size: {total_size / (1024*1024):.1f} MB", flush=True)
 
-            if supports_ranges and total_size:
-                results = run_parallel_download(url, total_size, chunk_size, download_workers, upload_workers)
-            else:
-                results = run_sequential_download(url, chunk_size, upload_workers)
+    try:
+        if supports_ranges and total_size:
+            results = run_parallel_download(url, total_size, chunk_size, download_workers, upload_workers)
+        else:
+            results = run_sequential_download(url, chunk_size, upload_workers)
     except Exception as e:
         print(f"[error] Failed downloading the source file: {e}", flush=True)
         sys.exit(1)
