@@ -440,6 +440,25 @@ def resolve_mediafire_direct_link(page_url):
 # magnet / torrent support
 # --------------------------------------------------------------------------
 
+EXTRA_TRACKERS_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
+
+
+def get_extra_trackers():
+    """Best-effort: pulls a supplementary list of public BitTorrent trackers
+    to raise the odds of finding peers (many magnet links only carry a
+    couple of trackers, which may be dead or overloaded). Never fails the
+    download if this doesn't work - it just means fewer trackers are used."""
+    try:
+        r = requests.get(EXTRA_TRACKERS_URL, timeout=(5, 10))
+        r.raise_for_status()
+        trackers = [line.strip() for line in r.text.splitlines() if line.strip()]
+        print(f"[aria2c] Fetched {len(trackers)} extra public trackers", flush=True)
+        return ",".join(trackers)
+    except Exception as e:
+        print(f"[aria2c] Could not fetch extra trackers list ({e}) - continuing without it", flush=True)
+        return ""
+
+
 def is_magnet_or_torrent(url):
     return url.lower().startswith("magnet:") or url.split("?", 1)[0].lower().endswith(".torrent")
 
@@ -447,10 +466,16 @@ def is_magnet_or_torrent(url):
 def download_torrent_or_magnet(url, dest_dir, connections=8):
     """Downloads a magnet link or .torrent file with aria2c and waits for it
     to finish (seed-time 0, so it stops right after the download completes).
-    If the torrent contains more than one file, they're zipped into a single
-    archive so the rest of the pipeline (which expects one local file) still
-    works unchanged."""
+    DHT, Peer Exchange and a supplementary public tracker list are enabled
+    to maximize the chance of finding peers. Note: on some networks
+    (including CI runners on datacenter IP ranges) some trackers/peers may
+    still refuse connections - this improves the odds but can't guarantee a
+    swarm with reachable peers. If the torrent contains more than one file,
+    they're zipped into a single archive so the rest of the pipeline (which
+    expects one local file) still works unchanged."""
     print(f"[aria2c] Starting torrent/magnet download -> {dest_dir}", flush=True)
+
+    extra_trackers = get_extra_trackers()
 
     cmd = [
         "aria2c",
@@ -461,9 +486,20 @@ def download_torrent_or_magnet(url, dest_dir, connections=8):
         "--file-allocation=none",
         "--summary-interval=5",
         "--console-log-level=warn",
-        "-d", dest_dir,
-        url,
+        "--enable-dht=true",
+        "--enable-dht6=false",
+        "--enable-peer-exchange=true",
+        "--bt-enable-lpd=true",
+        "--dht-listen-port=6881-6999",
+        "--listen-port=6881-6999",
+        "--bt-max-peers=200",
+        "--bt-tracker-connect-timeout=10",
+        "--bt-tracker-timeout=10",
+        "--bt-request-peer-speed-limit=0",
     ]
+    if extra_trackers:
+        cmd.append(f"--bt-tracker={extra_trackers}")
+    cmd += ["-d", dest_dir, url]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     for line in proc.stdout:
