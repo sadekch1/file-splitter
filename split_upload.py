@@ -27,6 +27,8 @@ GitHub Actions' ubuntu-latest runners.
 
 What this script accepts as <file_url>:
     - A direct http(s)/ftp/sftp link to a single file.
+    - A MediaFire share page (mediafire.com/file/...) - the real file link
+      is resolved from the page automatically.
     - An .m3u8 (HLS) playlist link.
     - A magnet: link or a direct .torrent file link (needs aria2c; the
       script waits for the download/seed to finish, then zips multi-file
@@ -50,6 +52,7 @@ Example:
 
 import sys
 import os
+import re
 import time
 import shutil
 import zipfile
@@ -390,6 +393,50 @@ def download_with_aria2c(url, dest_dir, dest_filename, connections=8, referer=No
 
 
 # --------------------------------------------------------------------------
+# MediaFire share-page resolution
+# --------------------------------------------------------------------------
+
+def is_mediafire_page(url):
+    """True for a MediaFire share page (mediafire.com/file/...), as opposed
+    to an already-resolved direct download#.mediafire.com file link."""
+    host = url.split("//", 1)[-1].split("/", 1)[0].lower()
+    return "mediafire.com" in host and not re.match(r"^download\d+\.mediafire\.com$", host)
+
+
+def resolve_mediafire_direct_link(page_url):
+    """MediaFire share links are an HTML page with a Download button; the
+    real file URL is generated per-page and embedded in that page's HTML.
+    This fetches the page and extracts the actual downloadN.mediafire.com
+    file link, the same one a browser follows when you click Download."""
+    print(f"[mediafire] Resolving direct link from {page_url}", flush=True)
+    r = session.get(page_url, timeout=(15, 30), headers={"Referer": "https://www.mediafire.com/"})
+    r.raise_for_status()
+    html = r.text
+
+    direct_link = None
+    m = re.search(r"https?://download\d+\.mediafire\.com/[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+/[^\s'\"<>]+", html)
+    if m:
+        direct_link = m.group(0)
+    if not direct_link:
+        m = re.search(r'id="downloadButton"[^>]*href="([^"]+)"', html)
+        if m:
+            direct_link = m.group(1)
+    if not direct_link:
+        m = re.search(r'href="([^"]+)"[^>]*id="downloadButton"', html)
+        if m:
+            direct_link = m.group(1)
+    if not direct_link:
+        raise RuntimeError(
+            "Could not find a direct download link on the MediaFire page - "
+            "check the link is correct, public, and not password-protected."
+        )
+
+    direct_link = direct_link.replace("&amp;", "&")
+    print(f"[mediafire] Resolved -> {direct_link}", flush=True)
+    return direct_link
+
+
+# --------------------------------------------------------------------------
 # magnet / torrent support
 # --------------------------------------------------------------------------
 
@@ -579,6 +626,9 @@ def main():
     )
 
     try:
+        if is_mediafire_page(url):
+            url = resolve_mediafire_direct_link(url)
+
         if is_magnet_or_torrent(url):
             if not has_aria2c():
                 raise RuntimeError("magnet/torrent links require aria2c, which was not found on PATH.")
