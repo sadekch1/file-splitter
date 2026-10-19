@@ -4,34 +4,67 @@ on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'رابط الملف (أو رابط m3u8) المراد تحميله وتقسيمه'
+        description: 'رابط الملف (مباشر أو m3u8) المراد تحميله وتقسيمه'
         required: true
       chunk_size_mb:
-        description: 'حجم الجزء بالميجابايت'
+        description: 'حجم الجزء بالميجابايت (الأقصى 1900)'
         required: false
-        default: '100'
+        default: '1000'
+      attempt:
+        description: 'رقم المحاولة (يُستخدم تلقائياً للاستكمال، لا تغيّره)'
+        required: false
+        default: '1'
 
 permissions:
-  contents: write
+  contents: write   # رفع الأجزاء إلى Release
+  actions: write    # إعادة تشغيل نفسه لاستكمال الملفات الكبيرة
+
+# لا نسمح بتشغيلين متزامنين حتى لا نضغط على GitHub
+concurrency:
+  group: split-upload
+  cancel-in-progress: false
 
 jobs:
   split-upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      FILE_URL: ${{ inputs.file_url }}
+      CHUNK_MB: ${{ inputs.chunk_size_mb }}
+      ATTEMPT: ${{ inputs.attempt }}
+      MAX_ATTEMPTS: '15'
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - run: pip install requests
-      - name: Install aria2 and ffmpeg
+
+      - name: Install ffmpeg (m3u8 only)
+        if: contains(inputs.file_url, '.m3u8')
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 ffmpeg
-          aria2c --version
-          ffmpeg -version
+          sudo apt-get install -y ffmpeg
+
       - name: Run split & upload
+        id: run
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 split_upload.py "$FILE_URL" "$CHUNK_MB"
+
+      - name: Continue in a new run if not finished
+        if: steps.run.outputs.status == 'continue'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 split_upload.py "${{ github.event.inputs.file_url }}" "${{ github.event.inputs.chunk_size_mb }}"
+          NEXT=$((ATTEMPT + 1))
+          if [ "$NEXT" -gt "$MAX_ATTEMPTS" ]; then
+            echo "Reached max attempts ($MAX_ATTEMPTS). Stopping."
+            exit 1
+          fi
+          gh workflow run remote-download.yml --ref "${{ github.ref_name }}" \
+            -f file_url="$FILE_URL" -f chunk_size_mb="$CHUNK_MB" -f attempt="$NEXT"
+          echo "Started continuation run #$NEXT"
