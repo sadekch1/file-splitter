@@ -1,685 +1,487 @@
 #!/usr/bin/env python3
 """
-Download a large file, split it into parts, and upload each part as an
-asset on a GitHub Release in this same repo. This avoids third-party
-file hosts (Litterbox/Catbox/Pixeldrain) blocking uploads that come
-from GitHub Actions' datacenter IPs - since this uses GitHub's own API
-with your own repo token, there's no such block.
+Download a very large file (100GB+) and store it as parts on a GitHub Release
+of this repo.
 
-Requires a GitHub token with `contents: write` permission on this repo.
-In a GitHub Actions workflow, the built-in ${{ secrets.GITHUB_TOKEN }}
-already has this by default - no extra secret needed.
-
-Faster download: direct file links are downloaded with aria2c (multiple
-connections per download, auto-resume) when it's available on PATH. If
-aria2c isn't installed, the script falls back to a built-in HTTP-Range
-multi-connection downloader instead. On GitHub Actions ubuntu-latest
-runners aria2c is normally preinstalled; if not, add a step such as
-`sudo apt-get update && sudo apt-get install -y aria2` before this script
-runs.
-
-HLS / m3u8 support: if <file_url> is (or points to) an .m3u8 playlist,
-it is downloaded and remuxed into a single file with ffmpeg first
-(handling segment downloading and playlist-referenced decryption),
-then that local file is split and uploaded exactly like any other
-source. ffmpeg must be available on PATH - it's preinstalled on
-GitHub Actions' ubuntu-latest runners.
-
-What this script accepts as <file_url>:
-    - A direct http(s)/ftp/sftp link to a single file.
-    - A MediaFire share page (mediafire.com/file/...) - the real file link
-      is resolved from the page automatically.
-    - An .m3u8 (HLS) playlist link.
-    - A magnet: link or a direct .torrent file link (needs aria2c; the
-      script waits for the download/seed to finish, then zips multi-file
-      torrents into one archive before splitting).
-It does NOT scrape/extract a hidden direct link out of a video player's
-page or API - point it at the actual media URL, the m3u8 URL, or the
-magnet/torrent link directly.
+Design goals
+  * Disk usage is bounded: at most --max-on-disk parts exist on disk at any
+    moment, so total file size does not matter (default ~4 x 1GB).
+  * Resumable: re-running with the same URL continues where it stopped
+    (already uploaded parts are detected and skipped). The workflow can
+    chain itself when the 6h job limit is near.
+  * Gentle on GitHub: one release per URL, uploads are serialized by default,
+    pauses between uploads, honors Retry-After / rate-limit headers.
+  * Integrity: sha256 per part (stored in the asset label), manifest.json,
+    sha256sums.txt, direct_links.txt and join instructions in the release.
 
 Usage:
-    python3 split_upload.py <file_url> [chunk_size_mb] [upload_workers] [download_connections]
+  python3 split_upload.py <url> [chunk_mb] [options]
 
-Required environment variables:
-    GITHUB_TOKEN      - a token with contents:write on the target repo
-    GITHUB_REPOSITORY - "owner/repo" (GitHub Actions sets this automatically)
+Env: GITHUB_TOKEN, GITHUB_REPOSITORY (set automatically in GitHub Actions)
 
-Example:
-    python3 split_upload.py "https://example.com/file.zip" 100 4 8
-    python3 split_upload.py "https://example.com/stream/index.m3u8" 100 4 8
-    python3 split_upload.py "magnet:?xt=urn:btih:...." 100 4 8
+Notes:
+  * Direct links with Range support -> resumable, parallel downloads.
+  * Servers without Range, and .m3u8 (via ffmpeg) -> single stream, NOT
+    resumable (must finish inside one run).
 """
-
-import sys
+import argparse
+import hashlib
+import math
 import os
 import re
-import time
-import shutil
-import zipfile
 import subprocess
+import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import unquote, urlparse
+
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+MB = 1024 * 1024
+API = "https://api.github.com"
+MAX_PART_MB = 1900      # GitHub limit is 2 GiB per asset
+MAX_ASSETS = 900        # GitHub limit is 1000 assets per release
 TEMP_DIR = "upload_parts"
-LINKS_FILE = "direct_links.txt"
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")  # "owner/repo"
-GITHUB_API = "https://api.github.com"
+T0 = time.time()
+_log_lock = threading.Lock()
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-})
-
-gh_session = requests.Session()
-gh_session.headers.update({
-    "Authorization": f"Bearer {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-})
-
-_upload_lock = threading.Lock()  # GitHub release asset uploads: do one at a time to avoid 422 name clashes
-_progress_lock = threading.Lock()
-_total_downloaded = [0]
-_last_progress_print = [0]
-PROGRESS_EVERY_BYTES = 10 * 1024 * 1024  # print every 10MB downloaded
-
-_release = {}  # filled in once by ensure_release()
+A = None
+REPO = ""
+DEADLINE = 0.0
+REL = {}
+src = None
+gh_s = None
+dl_sem = None
+up_sem = None
+state = {"est": 0.0, "done": 0}
 
 
-def report_download_progress(nbytes):
-    with _progress_lock:
-        _total_downloaded[0] += nbytes
-        if _total_downloaded[0] - _last_progress_print[0] >= PROGRESS_EVERY_BYTES:
-            print(f"[download] {_total_downloaded[0] / (1024*1024):.1f} MB downloaded so far...", flush=True)
-            _last_progress_print[0] = _total_downloaded[0]
+def log(msg):
+    with _log_lock:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def ensure_release():
-    """Creates a new GitHub Release to attach parts to, and caches its info."""
-    if _release:
-        return _release
-
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        raise RuntimeError(
-            "GITHUB_TOKEN and GITHUB_REPOSITORY environment variables are required. "
-            "In GitHub Actions, pass GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}."
-        )
-
-    tag = f"split-upload-{int(time.time())}"
-    payload = {
-        "tag_name": tag,
-        "name": f"Split upload {tag}",
-        "body": "Automatically generated by split_upload.py",
-        "draft": False,
-        "prerelease": True,
-    }
-    r = gh_session.post(f"{GITHUB_API}/repos/{GITHUB_REPOSITORY}/releases", json=payload, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    _release["id"] = data["id"]
-    _release["upload_url"] = data["upload_url"].split("{")[0]  # strip the {?name,label} template
-    _release["html_url"] = data["html_url"]
-    print(f"[release] Created release {tag}: {_release['html_url']}", flush=True)
-    return _release
+def set_output(key, value):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{key}={value}\n")
 
 
-def upload_asset_bytes(filepath, asset_name):
-    """Generic asset upload helper: uploads filepath under asset_name on the release.
-    Returns (success: bool, direct_link_or_error: str)."""
-    release = ensure_release()
-    start = time.time()
-    with _upload_lock:  # GitHub release asset upload endpoint doesn't like concurrent uploads well
-        with open(filepath, "rb") as f:
-            r = gh_session.post(
-                release["upload_url"],
-                params={"name": asset_name},
-                headers={"Content-Type": "application/octet-stream"},
-                data=f,
-                timeout=(15, 600),
-            )
-    elapsed = time.time() - start
-    if r.status_code in (200, 201):
-        data = r.json()
-        link = data.get("browser_download_url")
-        if link:
-            print(f"[timing] Upload of {asset_name} took {elapsed:.0f}s", flush=True)
-            return True, link
-    return False, f"HTTP {r.status_code} after {elapsed:.0f}s: {r.text[:300]}"
+def time_left():
+    return DEADLINE - time.time()
 
 
-def upload_github_release_asset(filepath, part_num):
-    """Uploads a file as an asset on the shared release.
-    Returns (success: bool, direct_link_or_error: str)."""
-    filename = os.path.basename(filepath)
-    return upload_asset_bytes(filepath, filename)
+# --------------------------------------------------------------- GitHub API
+def rate_wait(r):
+    """Seconds to wait if GitHub says we are rate limited, else 0."""
+    if r.status_code not in (403, 429):
+        return 0
+    ra = r.headers.get("Retry-After")
+    if ra and ra.isdigit():
+        return min(int(ra) + 1, 900)
+    if r.headers.get("x-ratelimit-remaining") == "0":
+        reset = int(r.headers.get("x-ratelimit-reset", "0") or 0)
+        return min(max(reset - int(time.time()), 1) + 1, 900)
+    low = r.text.lower()
+    if "rate limit" in low or "abuse" in low:
+        return 60
+    return 0
 
 
-def upload_links_file(path, max_retries=4):
-    """Uploads the direct_links.txt file itself as a release asset, so the
-    ordered list of part links is also downloadable straight from the
-    release page. Returns the browser_download_url, or None on failure."""
-    print(f"[upload] Uploading {os.path.basename(path)} to GitHub Release...", flush=True)
-    backoff = 5.0
-    asset_name = os.path.basename(path)
-    for attempt in range(1, max_retries + 1):
+def gh(method, path, **kw):
+    url = path if path.startswith("http") else API + path
+    delay = 3
+    for attempt in range(1, A.retries + 1):
         try:
-            ok, result = upload_asset_bytes(path, asset_name)
-            if ok:
-                print(f"[done] {asset_name}: {result}", flush=True)
-                return result
-            print(f"[warn] Attempt {attempt} for {asset_name} failed: {result}", flush=True)
-            if "422" in result or "already_exists" in result.lower():
-                # Name clash - suffix a counter and retry immediately
-                asset_name = f"direct_links_{attempt}.txt"
-                continue
-        except requests.exceptions.Timeout:
-            print(f"[warn] {asset_name} attempt {attempt}: connection timed out", flush=True)
-        except Exception as e:
-            print(f"[warn] Error uploading {asset_name} (attempt {attempt}): {e}", flush=True)
-        time.sleep(backoff)
-        backoff = min(backoff * 2, 60)
+            r = gh_s.request(method, url, timeout=60, **kw)
+        except requests.RequestException as e:
+            log(f"GitHub API error ({e}); retry {attempt}")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+            continue
+        wait = rate_wait(r)
+        if wait:
+            log(f"GitHub asked us to slow down - waiting {wait}s")
+            time.sleep(wait)
+            continue
+        if r.status_code >= 500:
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+            continue
+        return r
+    raise RuntimeError(f"GitHub API {method} {url} kept failing")
+
+
+def ensure_release(name):
+    r = gh("GET", f"/repos/{REPO}/releases/tags/{A.tag}")
+    if r.status_code == 404:
+        r = gh("POST", f"/repos/{REPO}/releases", json={
+            "tag_name": A.tag,
+            "name": f"{name} (split)",
+            "body": "Upload in progress...",
+            "prerelease": True,
+        })
+    r.raise_for_status()
+    d = r.json()
+    REL.update(id=d["id"], upload_url=d["upload_url"].split("{")[0], html_url=d["html_url"])
+    log(f"Release: {REL['html_url']}")
+
+
+def list_assets():
+    out, page = [], 1
+    while True:
+        r = gh("GET", f"/repos/{REPO}/releases/{REL['id']}/assets",
+               params={"per_page": 100, "page": page})
+        r.raise_for_status()
+        batch = r.json()
+        out += batch
+        if len(batch) < 100:
+            return out
+        page += 1
+
+
+def upload(path, name, label=""):
+    """Upload one file as a release asset. Returns download URL or None."""
+    size = os.path.getsize(path)
+    delay = 5
+    for attempt in range(1, A.retries + 1):
+        stale = next((a for a in list_assets() if a["name"] == name), None)
+        if stale:
+            # a previous attempt may have actually succeeded
+            if (attempt > 1 and label and stale["state"] == "uploaded"
+                    and stale["size"] == size and stale.get("label") == label):
+                return stale["browser_download_url"]
+            gh("DELETE", f"/repos/{REPO}/releases/assets/{stale['id']}")
+        params = {"name": name}
+        if label:
+            params["label"] = label
+        t = time.time()
+        try:
+            with open(path, "rb") as f:
+                r = gh_s.post(REL["upload_url"], params=params,
+                              headers={"Content-Type": "application/octet-stream"},
+                              data=f, timeout=(20, 1800))
+        except requests.RequestException as e:
+            log(f"upload of {name} failed ({e}); attempt {attempt}")
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
+            continue
+        if r.status_code in (200, 201):
+            log(f"uploaded {name} ({size / MB:.0f} MB in {time.time() - t:.0f}s)")
+            return r.json()["browser_download_url"]
+        wait = rate_wait(r)
+        log(f"upload of {name} failed: HTTP {r.status_code} {r.text[:200]}")
+        time.sleep(wait or delay)
+        delay = min(delay * 2, 120)
     return None
 
 
-def upload_worker(part_num, filepath, max_retries=4):
-    print(f"[upload] Starting upload of part {part_num} to GitHub Release...", flush=True)
-    backoff = 5.0
-    for attempt in range(1, max_retries + 1):
-        try:
-            ok, result = upload_github_release_asset(filepath, part_num)
-            if ok:
-                print(f"[done] Part {part_num}: {result}", flush=True)
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-                return part_num, result
-            print(f"[warn] Attempt {attempt} for part {part_num} failed: {result}", flush=True)
-            if "422" in result or "already_exists" in result.lower():
-                # Rare name clash - regenerate a fresh unique filename and retry immediately
-                new_path = filepath + f".{attempt}"
-                os.rename(filepath, new_path)
-                filepath = new_path
-                continue
-        except requests.exceptions.Timeout:
-            print(f"[warn] Part {part_num} attempt {attempt}: connection timed out", flush=True)
-        except Exception as e:
-            print(f"[warn] Error uploading part {part_num} (attempt {attempt}): {e}", flush=True)
-        time.sleep(backoff)
-        backoff = min(backoff * 2, 60)
-    if os.path.exists(filepath):
-        os.remove(filepath)
-    return part_num, None
+# ------------------------------------------------------------------ source
+def sanitize(name):
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "file.bin"
+    return name[:150]
 
 
-def check_range_support(url):
-    """Returns (supports_ranges: bool, total_size: int or None)."""
-    try:
-        r = session.head(url, timeout=(10, 20), allow_redirects=True)
-        size = r.headers.get("Content-Length")
-        accepts_ranges = r.headers.get("Accept-Ranges", "").lower() == "bytes"
-        if not accepts_ranges and size:
-            probe = session.get(url, headers={"Range": "bytes=0-0"}, timeout=(10, 20), stream=True)
-            accepts_ranges = probe.status_code == 206
-            probe.close()
-        return accepts_ranges, (int(size) if size else None)
-    except Exception:
-        return False, None
-
-
-def download_range(url, start, end, dest_path, part_num):
-    headers = {"Range": f"bytes={start}-{end}"}
-    with session.get(url, headers=headers, stream=True, timeout=(15, 60)) as r:
-        r.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                report_download_progress(len(chunk))
-    print(f"[download] Part {part_num} complete ({(end - start + 1) / (1024*1024):.1f} MB)", flush=True)
-    return part_num, dest_path
-
-
-def run_parallel_download(url, total_size, chunk_size, download_workers, upload_workers):
-    num_parts = (total_size + chunk_size - 1) // chunk_size
-    print(
-        f"[download] Server supports parallel ranged downloads - "
-        f"{num_parts} part(s), {download_workers} download connections",
-        flush=True,
-    )
-
-    download_executor = ThreadPoolExecutor(max_workers=download_workers)
-    upload_executor = ThreadPoolExecutor(max_workers=upload_workers)
-
-    download_futures = []
-    for part_num in range(1, num_parts + 1):
-        start = (part_num - 1) * chunk_size
-        end = min(start + chunk_size - 1, total_size - 1)
-        dest_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}.zip")
-        fut = download_executor.submit(download_range, url, start, end, dest_path, part_num)
-        download_futures.append(fut)
-
-    upload_futures = []
-    for fut in as_completed(download_futures):
-        part_num, dest_path = fut.result()
-        upload_futures.append(upload_executor.submit(upload_worker, part_num, dest_path))
-
-    download_executor.shutdown(wait=True)
-
-    results = []
-    for fut in as_completed(upload_futures):
-        res = fut.result()
-        if res and res[1]:
-            results.append(res)
-        else:
-            print("[error] One of the background uploads failed!", flush=True)
-
-    upload_executor.shutdown(wait=True)
-    return results
-
-
-def run_sequential_download(url, chunk_size, upload_workers):
-    print("[download] Server does not support ranged downloads - using a single stream", flush=True)
-
-    upload_executor = ThreadPoolExecutor(max_workers=upload_workers)
-    upload_futures = []
-
-    part_num = 1
-    current_size = 0
-
-    with session.get(url, stream=True, timeout=(15, 60)) as r:
-        r.raise_for_status()
-        part_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}.zip")
-        part_file = open(part_path, "wb")
-        try:
-            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                if not chunk:
-                    continue
-                part_file.write(chunk)
-                current_size += len(chunk)
-                report_download_progress(len(chunk))
-
-                if current_size >= chunk_size:
-                    part_file.close()
-                    print(f"[download] Part {part_num} complete ({current_size / (1024*1024):.1f} MB), queuing upload...", flush=True)
-                    upload_futures.append(upload_executor.submit(upload_worker, part_num, part_path))
-                    part_num += 1
-                    current_size = 0
-                    part_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}.zip")
-                    part_file = open(part_path, "wb")
-
-            part_file.close()
-            if current_size > 0:
-                print(f"[download] Final part {part_num} complete ({current_size / (1024*1024):.1f} MB), queuing upload...", flush=True)
-                upload_futures.append(upload_executor.submit(upload_worker, part_num, part_path))
-            elif os.path.exists(part_path):
-                os.remove(part_path)
-        finally:
-            if not part_file.closed:
-                part_file.close()
-
-    results = []
-    for fut in as_completed(upload_futures):
-        res = fut.result()
-        if res and res[1]:
-            results.append(res)
-        else:
-            print("[error] One of the background uploads failed!", flush=True)
-
-    upload_executor.shutdown(wait=True)
-    return results
-
-
-# --------------------------------------------------------------------------
-# aria2c downloader (direct file links)
-# --------------------------------------------------------------------------
-
-def has_aria2c():
-    return shutil.which("aria2c") is not None
-
-
-def guess_download_filename(url):
-    """Best-effort filename for the local copy, based on the URL path."""
-    name = url.split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
-    return name if name else "source_download.bin"
-
-
-def download_with_aria2c(url, dest_dir, dest_filename, connections=8, referer=None):
-    """Downloads url to dest_dir/dest_filename using aria2c, which opens
-    several connections per download (and auto-resumes on failure) for much
-    faster throughput than a single HTTP stream. Works for http(s), ftp and
-    sftp links."""
-    dest_path = os.path.join(dest_dir, dest_filename)
-    print(f"[aria2c] Downloading with aria2c ({connections} connections) -> {dest_path}", flush=True)
-
-    header_args = []
-    if url.lower().startswith(("http://", "https://")):
-        header_args.append(f"--header=User-Agent: {session.headers['User-Agent']}")
-        if referer:
-            header_args.append(f"--header=Referer: {referer}")
-
-    cmd = [
-        "aria2c",
-        "-x", str(connections),        # max connections per server
-        "-s", str(connections),        # number of pieces to split into
-        "-k", "1M",                    # min split size per piece
-        "--file-allocation=none",
-        "--continue=true",
-        "--auto-file-renaming=false",
-        "--allow-overwrite=true",
-        "--summary-interval=5",
-        "--console-log-level=warn",
-        "-d", dest_dir,
-        "-o", dest_filename,
-        *header_args,
-        url,
-    ]
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    for line in proc.stdout:
-        line = line.strip()
-        if line:
-            print(f"[aria2c] {line}", flush=True)
-    proc.wait()
-
-    if proc.returncode != 0 or not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
-        raise RuntimeError(f"aria2c failed to download the file (exit code {proc.returncode}).")
-
-    size_mb = os.path.getsize(dest_path) / (1024 * 1024)
-    print(f"[aria2c] Done - downloaded {size_mb:.1f} MB", flush=True)
-    return dest_path
-
-
-# --------------------------------------------------------------------------
-# MediaFire share-page resolution
-# --------------------------------------------------------------------------
-
-def is_mediafire_page(url):
-    """True for a MediaFire share page (mediafire.com/file/...), as opposed
-    to an already-resolved direct download#.mediafire.com file link."""
-    host = url.split("//", 1)[-1].split("/", 1)[0].lower()
-    return "mediafire.com" in host and not re.match(r"^download\d+\.mediafire\.com$", host)
-
-
-def resolve_mediafire_direct_link(page_url):
-    """MediaFire share links are an HTML page with a Download button; the
-    real file URL is generated per-page and embedded in that page's HTML.
-    This fetches the page and extracts the actual downloadN.mediafire.com
-    file link, the same one a browser follows when you click Download."""
-    print(f"[mediafire] Resolving direct link from {page_url}", flush=True)
-    r = session.get(page_url, timeout=(15, 30), headers={"Referer": "https://www.mediafire.com/"})
-    r.raise_for_status()
-    html = r.text
-
-    direct_link = None
-    m = re.search(r"https?://download\d+\.mediafire\.com/[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+/[^\s'\"<>]+", html)
+def guess_name(url, headers):
+    cd = headers.get("Content-Disposition", "")
+    m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd)
     if m:
-        direct_link = m.group(0)
-    if not direct_link:
-        m = re.search(r'id="downloadButton"[^>]*href="([^"]+)"', html)
-        if m:
-            direct_link = m.group(1)
-    if not direct_link:
-        m = re.search(r'href="([^"]+)"[^>]*id="downloadButton"', html)
-        if m:
-            direct_link = m.group(1)
-    if not direct_link:
-        raise RuntimeError(
-            "Could not find a direct download link on the MediaFire page - "
-            "check the link is correct, public, and not password-protected."
-        )
-
-    direct_link = direct_link.replace("&amp;", "&")
-    print(f"[mediafire] Resolved -> {direct_link}", flush=True)
-    return direct_link
+        return sanitize(unquote(m.group(1)))
+    return sanitize(os.path.basename(unquote(urlparse(url).path)))
 
 
-# --------------------------------------------------------------------------
-# magnet / torrent support
-# --------------------------------------------------------------------------
-
-def is_magnet_or_torrent(url):
-    return url.lower().startswith("magnet:") or url.split("?", 1)[0].lower().endswith(".torrent")
-
-
-def download_torrent_or_magnet(url, dest_dir, connections=8):
-    """Downloads a magnet link or .torrent file with aria2c and waits for it
-    to finish (seed-time 0, so it stops right after the download completes).
-    If the torrent contains more than one file, they're zipped into a single
-    archive so the rest of the pipeline (which expects one local file) still
-    works unchanged."""
-    print(f"[aria2c] Starting torrent/magnet download -> {dest_dir}", flush=True)
-
-    cmd = [
-        "aria2c",
-        "-x", str(connections),
-        "-s", str(connections),
-        "--seed-time=0",
-        "--bt-stop-timeout=600",
-        "--file-allocation=none",
-        "--summary-interval=5",
-        "--console-log-level=warn",
-        "-d", dest_dir,
-        url,
-    ]
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    for line in proc.stdout:
-        line = line.strip()
-        if line:
-            print(f"[aria2c] {line}", flush=True)
-    proc.wait()
-
-    if proc.returncode != 0:
-        raise RuntimeError(f"aria2c failed to download the torrent/magnet link (exit code {proc.returncode}).")
-
-    downloaded = [
-        f for f in os.listdir(dest_dir)
-        if not f.endswith(".aria2") and not f.endswith(".torrent")
-    ]
-    if not downloaded:
-        raise RuntimeError("aria2c finished but no downloaded files were found.")
-
-    if len(downloaded) == 1 and os.path.isfile(os.path.join(dest_dir, downloaded[0])):
-        result_path = os.path.join(dest_dir, downloaded[0])
-        size_mb = os.path.getsize(result_path) / (1024 * 1024)
-        print(f"[aria2c] Done - downloaded {size_mb:.1f} MB", flush=True)
-        return result_path
-
-    print(f"[aria2c] Torrent contains multiple items - zipping into one archive...", flush=True)
-    zip_path = os.path.join(dest_dir, "torrent_download.zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name in downloaded:
-            full_path = os.path.join(dest_dir, name)
-            if os.path.isfile(full_path):
-                zf.write(full_path, name)
-            else:
-                for root, _, filenames in os.walk(full_path):
-                    for fn in filenames:
-                        fp = os.path.join(root, fn)
-                        zf.write(fp, os.path.relpath(fp, dest_dir))
-    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-    print(f"[aria2c] Done - zipped into {size_mb:.1f} MB archive", flush=True)
-    return zip_path
+def probe(url):
+    """Returns (total_size or None, supports_ranges, headers)."""
+    r = src.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=(20, 30))
+    try:
+        if r.status_code == 206:
+            m = re.search(r"/(\d+)$", r.headers.get("Content-Range", ""))
+            return (int(m.group(1)) if m else None), bool(m), r.headers
+        r.raise_for_status()
+        cl = r.headers.get("Content-Length")
+        return (int(cl) if cl else None), False, r.headers
+    finally:
+        r.close()
 
 
-# --------------------------------------------------------------------------
-# HLS / m3u8 support
-# --------------------------------------------------------------------------
-
-def is_m3u8_url(url):
-    """Detects an HLS playlist link: ends in .m3u8, or has it in the path/query
-    (common when the link was extracted from a video player's network requests)."""
-    path_only = url.split("?", 1)[0].split("#", 1)[0]
-    return path_only.lower().endswith(".m3u8") or ".m3u8" in url.lower()
-
-
-def download_hls_to_file(url, dest_path, referer=None):
-    """Downloads an HLS (.m3u8) stream to a single local file using ffmpeg.
-    Works for master or media playlists - ffmpeg handles segment downloading,
-    playlist-referenced AES-128 decryption, and remuxing into one file.
-    Requires ffmpeg on PATH (preinstalled on GitHub Actions ubuntu runners)."""
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError(
-            "ffmpeg is required to download m3u8/HLS links but was not found on PATH. "
-            "It's preinstalled on GitHub Actions ubuntu-latest runners; locally install it "
-            "(e.g. `apt-get install -y ffmpeg` or `brew install ffmpeg`)."
-        )
-
-    print(f"[hls] Detected an m3u8 link - downloading the stream with ffmpeg -> {dest_path}", flush=True)
-
-    headers = f"User-Agent: {session.headers['User-Agent']}\r\n"
-    if referer:
-        headers += f"Referer: {referer}\r\n"
-
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning", "-stats",
-        "-headers", headers,
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-        "-i", url,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        dest_path,
-    ]
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    last_print = 0.0
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        now = time.time()
-        if "time=" in line or "error" in line.lower():
-            if now - last_print >= 5:
-                print(f"[hls] {line}", flush=True)
-                last_print = now
-    proc.wait()
-
-    if proc.returncode != 0 or not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
-        raise RuntimeError(f"ffmpeg failed to download the HLS stream (exit code {proc.returncode}).")
-
-    size_mb = os.path.getsize(dest_path) / (1024 * 1024)
-    print(f"[hls] Done - downloaded and remuxed {size_mb:.1f} MB", flush=True)
-    return dest_path
+def download_range(url, start, end, path):
+    """Download bytes [start, end] into path, resuming on errors. Returns sha256."""
+    expected = end - start + 1
+    h = hashlib.sha256()
+    got = 0
+    delay = 3
+    if os.path.exists(path):
+        os.remove(path)
+    for attempt in range(1, A.retries + 1):
+        try:
+            with src.get(url, headers={"Range": f"bytes={start + got}-{end}"},
+                         stream=True, timeout=(20, 60)) as r:
+                if r.status_code != 206:
+                    raise RuntimeError(f"HTTP {r.status_code} for a range request")
+                with open(path, "ab") as f:
+                    for chunk in r.iter_content(8 * MB):
+                        if chunk:
+                            f.write(chunk)
+                            h.update(chunk)
+                            got += len(chunk)
+            if got == expected:
+                return h.hexdigest()
+            raise RuntimeError(f"short read {got}/{expected}")
+        except (requests.RequestException, RuntimeError) as e:
+            log(f"download error ({e}); attempt {attempt}, have {got / MB:.0f} MB")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+    raise RuntimeError("download kept failing")
 
 
-def split_local_file_and_upload(local_path, chunk_size, upload_workers, part_ext=".mp4"):
-    """Splits an already-downloaded local file into chunk_size parts and
-    uploads each one as it's cut, reusing the same upload_worker used for
-    the direct-download path."""
-    total_size = os.path.getsize(local_path)
-    num_parts = (total_size + chunk_size - 1) // chunk_size
-    print(
-        f"[split] Source is {total_size / (1024*1024):.1f} MB - splitting into "
-        f"{num_parts} part(s) of up to {chunk_size / (1024*1024):.0f}MB",
-        flush=True,
-    )
+def source_chunks(url, is_m3u8):
+    if is_m3u8:
+        proc = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", url,
+             "-c", "copy", "-f", "mpegts", "pipe:1"], stdout=subprocess.PIPE)
+        try:
+            while True:
+                b = proc.stdout.read(8 * MB)
+                if not b:
+                    break
+                yield b
+            proc.stdout.close()
+            if proc.wait() != 0:
+                raise RuntimeError(f"ffmpeg exited with code {proc.returncode}")
+        except BaseException:
+            proc.kill()
+            raise
+    else:
+        with src.get(url, stream=True, timeout=(20, 60)) as r:
+            r.raise_for_status()
+            yield from r.iter_content(8 * MB)
 
-    upload_executor = ThreadPoolExecutor(max_workers=upload_workers)
-    upload_futures = []
 
-    part_num = 1
-    with open(local_path, "rb") as src:
-        while True:
-            chunk = src.read(chunk_size)
-            if not chunk:
+# ------------------------------------------------------------- range mode
+def process_part(p):
+    if time_left() < state["est"] * 1.3:
+        return "deferred"
+    path = os.path.join(TEMP_DIR, p["name"])
+    t = time.time()
+    try:
+        with dl_sem:
+            sha = download_range(A.url, p["start"], p["end"], path)
+        with up_sem:
+            link = upload(path, p["name"], f"sha256:{sha}")
+            time.sleep(A.pause)
+    except Exception as e:  # noqa: BLE001
+        log(f"part {p['idx']} failed: {e}")
+        return "failed"
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+    if not link:
+        return "failed"
+    state["est"] = max(state["est"], time.time() - t)
+    state["done"] += 1
+    log(f"part {p['idx']} done ({state['done']} this run)")
+    return "done"
+
+
+def run_ranges(name, total, chunk):
+    n = math.ceil(total / chunk)
+    if n > MAX_ASSETS:
+        chunk = math.ceil(math.ceil(total / MAX_ASSETS) / MB) * MB
+        if chunk > MAX_PART_MB * MB:
+            raise SystemExit("File too large for a single release (over ~1.7 TB).")
+        n = math.ceil(total / chunk)
+        log(f"Part size raised to {chunk // MB} MB to stay under the release asset limit")
+    parts = []
+    for i in range(n):
+        s, e = i * chunk, min((i + 1) * chunk, total) - 1
+        parts.append(dict(idx=i + 1, start=s, end=e, size=e - s + 1,
+                          name=f"{name}.part{i + 1:04d}"))
+    existing = {a["name"]: a for a in list_assets()}
+    pending = [p for p in parts if not (
+        p["name"] in existing and existing[p["name"]]["state"] == "uploaded"
+        and existing[p["name"]]["size"] == p["size"])]
+    log(f"{n} parts of up to {chunk // MB} MB: "
+        f"{n - len(pending)} already uploaded, {len(pending)} to do")
+
+    with ThreadPoolExecutor(A.max_on_disk) as pool:
+        statuses = list(pool.map(process_part, pending))
+    failed, done = statuses.count("failed"), statuses.count("done")
+
+    names = [p["name"] for p in parts]
+    now = {a["name"]: a for a in list_assets()}
+    if all(nm in now and now[nm]["state"] == "uploaded" for nm in names):
+        finalize(name, names)
+        return "complete"
+    if failed and not done:
+        return "failed"
+    return "continue"
+
+
+# ------------------------------------------------------------ stream mode
+def run_stream(name, chunk, is_m3u8):
+    slots = threading.BoundedSemaphore(A.max_on_disk)
+    pool = ThreadPoolExecutor(A.upload_workers)
+    futs = []
+
+    def finish(i, path, sha):
+        try:
+            link = upload(path, f"{name}.part{i:04d}", f"sha256:{sha}")
+            time.sleep(A.pause)
+            return link is not None
+        except Exception as e:  # noqa: BLE001
+            log(f"part {i} failed: {e}")
+            return False
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+            slots.release()
+
+    idx, cur, f, h, path = 0, 0, None, None, None
+    aborted = False
+    try:
+        for chunk_bytes in source_chunks(A.url, is_m3u8):
+            if time_left() <= 0:
+                log("Time limit reached; stream mode cannot resume.")
+                aborted = True
                 break
-            part_path = os.path.join(TEMP_DIR, f"part_{part_num:02d}{part_ext}")
-            with open(part_path, "wb") as pf:
-                pf.write(chunk)
-            print(f"[split] Part {part_num} ready ({len(chunk) / (1024*1024):.1f} MB), queuing upload...", flush=True)
-            upload_futures.append(upload_executor.submit(upload_worker, part_num, part_path))
-            part_num += 1
+            mv = memoryview(chunk_bytes)
+            while len(mv):
+                if f is None:
+                    slots.acquire()          # back-pressure: stops reading the source
+                    idx += 1
+                    if idx > MAX_ASSETS:
+                        raise RuntimeError("Too many parts - use a bigger chunk size")
+                    path = os.path.join(TEMP_DIR, f"{name}.part{idx:04d}")
+                    f, h, cur = open(path, "wb"), hashlib.sha256(), 0
+                piece = mv[:chunk - cur]
+                f.write(piece)
+                h.update(piece)
+                cur += len(piece)
+                mv = mv[len(piece):]
+                if cur >= chunk:
+                    f.close()
+                    futs.append(pool.submit(finish, idx, path, h.hexdigest()))
+                    f = None
+        if f is not None:
+            f.close()
+            futs.append(pool.submit(finish, idx, path, h.hexdigest()))
+    except Exception as e:  # noqa: BLE001
+        log(f"stream error: {e}")
+        aborted = True
+        if f is not None and not f.closed:
+            f.close()
+    ok = all(x.result() for x in futs)
+    pool.shutdown()
+    if aborted or not ok or idx == 0:
+        return "failed"
+    finalize(name, [f"{name}.part{i:04d}" for i in range(1, idx + 1)])
+    return "complete"
 
-    results = []
-    for fut in as_completed(upload_futures):
-        res = fut.result()
-        if res and res[1]:
-            results.append(res)
-        else:
-            print("[error] One of the background uploads failed!", flush=True)
 
-    upload_executor.shutdown(wait=True)
-    return results
+# --------------------------------------------------------------- finalize
+def finalize(name, part_names):
+    assets = {a["name"]: a for a in list_assets()}
+    rows = []
+    for pn in part_names:
+        a = assets[pn]
+        rows.append(dict(name=pn, size=a["size"],
+                         sha256=a.get("label", "").replace("sha256:", ""),
+                         url=a["browser_download_url"]))
+    total = sum(r["size"] for r in rows)
+    files = {
+        "direct_links.txt": "\n".join(r["url"] for r in rows) + "\n",
+        "sha256sums.txt": "".join(f"{r['sha256']}  {r['name']}\n" for r in rows if r["sha256"]),
+        "manifest.json": __import__("json").dumps(
+            dict(file_name=name, total_size=total, parts=rows), indent=2),
+    }
+    for fname, content in files.items():
+        p = os.path.join(TEMP_DIR, fname)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        upload(p, fname)
+    with open("direct_links.txt", "w", encoding="utf-8") as fh:
+        fh.write(files["direct_links.txt"])
+    body = (
+        f"`{name}` - {len(rows)} parts, {total / (1024 ** 3):.2f} GB\n\n"
+        f"Join (Linux / macOS / WSL / Git Bash):\n```\ncat {name}.part* > {name}\n```\n"
+        f"Verify the parts first (optional):\n```\nsha256sum -c sha256sums.txt\n```\n"
+        f"All links: `direct_links.txt`, details: `manifest.json`."
+    )
+    gh("PATCH", f"/repos/{REPO}/releases/{REL['id']}", json={"body": body})
+    log(f"All {len(rows)} parts ready: {REL['html_url']}")
+
+
+# ------------------------------------------------------------------- main
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("url")
+    p.add_argument("chunk_mb", nargs="?", type=int, default=1000)
+    p.add_argument("--name", help="output file name (default: from URL)")
+    p.add_argument("--tag", help="release tag (default: derived from URL, so reruns resume)")
+    p.add_argument("--max-on-disk", type=int, default=4, help="max parts on disk at once")
+    p.add_argument("--download-workers", type=int, default=3)
+    p.add_argument("--upload-workers", type=int, default=1)
+    p.add_argument("--time-limit-min", type=float, default=330)
+    p.add_argument("--pause", type=float, default=3.0, help="seconds between uploads")
+    p.add_argument("--retries", type=int, default=5)
+    p.add_argument("--user-agent", default="file-splitter/2.0")
+    return p.parse_args()
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 split_upload.py <file_url_or_m3u8_link> [chunk_size_mb] [upload_workers] [download_connections]")
-        print("Requires env vars GITHUB_TOKEN and GITHUB_REPOSITORY (owner/repo).")
-        sys.exit(1)
+    global A, REPO, DEADLINE, src, gh_s, dl_sem, up_sem
+    A = parse_args()
+    token = os.environ.get("GITHUB_TOKEN", "")
+    REPO = os.environ.get("GITHUB_REPOSITORY", "")
+    if not token or not REPO:
+        sys.exit("GITHUB_TOKEN and GITHUB_REPOSITORY are required.")
+    DEADLINE = T0 + A.time_limit_min * 60
+    A.max_on_disk = max(A.max_on_disk, 1)
+    chunk = min(max(A.chunk_mb, 1), MAX_PART_MB) * MB
+    if not A.tag:
+        A.tag = "split-" + hashlib.sha1(A.url.encode()).hexdigest()[:10]
 
-    url = sys.argv[1]
-    chunk_size_mb = int(sys.argv[2]) if len(sys.argv) > 2 else 100
-    upload_workers = int(sys.argv[3]) if len(sys.argv) > 3 else 2  # GitHub release uploads are serialized anyway
-    download_workers = int(sys.argv[4]) if len(sys.argv) > 4 else 8
-
-    chunk_size = chunk_size_mb * 1024 * 1024
+    src = requests.Session()
+    src.headers.update({"User-Agent": A.user_agent, "Accept-Encoding": "identity"})
+    gh_s = requests.Session()
+    gh_s.headers.update({"Authorization": f"Bearer {token}",
+                         "Accept": "application/vnd.github+json",
+                         "X-GitHub-Api-Version": "2022-11-28"})
+    dl_sem = threading.Semaphore(A.download_workers)
+    up_sem = threading.Semaphore(A.upload_workers)
     os.makedirs(TEMP_DIR, exist_ok=True)
 
-    print(
-        f"Starting - chunk size {chunk_size_mb}MB - service: GitHub Release assets - "
-        f"upload workers: {upload_workers} - download connections: {download_workers}",
-        flush=True,
-    )
-
-    try:
-        if is_mediafire_page(url):
-            url = resolve_mediafire_direct_link(url)
-
-        if is_magnet_or_torrent(url):
-            if not has_aria2c():
-                raise RuntimeError("magnet/torrent links require aria2c, which was not found on PATH.")
-            local_path = download_torrent_or_magnet(url, TEMP_DIR, connections=download_workers)
-            _, ext = os.path.splitext(local_path)
-            results = split_local_file_and_upload(local_path, chunk_size, upload_workers, part_ext=ext or ".bin")
-        elif is_m3u8_url(url):
-            local_path = os.path.join(TEMP_DIR, "hls_source.mp4")
-            download_hls_to_file(url, local_path)
-            results = split_local_file_and_upload(local_path, chunk_size, upload_workers)
-        elif has_aria2c():
-            dest_filename = guess_download_filename(url)
-            local_path = download_with_aria2c(url, TEMP_DIR, dest_filename, connections=download_workers)
-            _, ext = os.path.splitext(dest_filename)
-            results = split_local_file_and_upload(local_path, chunk_size, upload_workers, part_ext=ext or ".bin")
-        else:
-            print("[warn] aria2c not found on PATH - falling back to the built-in HTTP downloader", flush=True)
-            print("Checking source server capabilities...", flush=True)
-            supports_ranges, total_size = check_range_support(url)
-            if total_size:
-                print(f"Source size: {total_size / (1024*1024):.1f} MB", flush=True)
-
-            if supports_ranges and total_size:
-                results = run_parallel_download(url, total_size, chunk_size, download_workers, upload_workers)
-            else:
-                results = run_sequential_download(url, chunk_size, upload_workers)
-    except Exception as e:
-        print(f"[error] Failed downloading the source file: {e}", flush=True)
-        sys.exit(1)
-
-    # Sort ascending by part number so the .txt (and the printed order) is
-    # always Part 1, Part 2, Part 3, ... regardless of upload/finish order.
-    results.sort(key=lambda x: x[0])
-
-    with open(LINKS_FILE, "w", encoding="utf-8") as f:
-        for num, link in results:
-            f.write(f"{link}\n")
-
-    # Also upload the links file itself as a release asset, so anyone
-    # visiting the release page can grab the ordered list directly
-    # without needing the Actions log.
-    links_asset_url = upload_links_file(LINKS_FILE)
-    if links_asset_url:
-        print(f"[done] {LINKS_FILE}: {links_asset_url}", flush=True)
+    is_m3u8 = ".m3u8" in urlparse(A.url).path.lower()
+    total, ranges, headers = None, False, {}
+    if not is_m3u8:
+        total, ranges, headers = probe(A.url)
+    if A.name:
+        name = sanitize(A.name)
+    elif is_m3u8:
+        name = sanitize(os.path.splitext(os.path.basename(urlparse(A.url).path))[0]) + ".ts"
     else:
-        print(f"[error] Failed to upload {LINKS_FILE} to the release (parts were still uploaded).", flush=True)
+        name = guess_name(A.url, headers)
 
-    if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR, ignore_errors=True)
+    log(f"File: {name} | size: "
+        f"{f'{total / (1024 ** 3):.2f} GB' if total else 'unknown'} | "
+        f"mode: {'ranged (resumable)' if ranges and total else 'single stream (not resumable)'}")
+    ensure_release(name)
 
-    print(f"[finished] All parts uploaded. Links saved to {LINKS_FILE}.", flush=True)
+    if ranges and total:
+        status = run_ranges(name, total, chunk)
+    else:
+        status = run_stream(name, chunk, is_m3u8)
+
+    set_output("status", status)
+    set_output("release_url", REL.get("html_url", ""))
+    log(f"Status: {status}")
+    if status == "continue":
+        log("Not finished yet - run again (the workflow does this automatically).")
+    sys.exit(1 if status == "failed" else 0)
 
 
 if __name__ == "__main__":
